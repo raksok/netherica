@@ -1,0 +1,156 @@
+# Netherica config v3.1
+[settings]
+strict_chronological = true
+
+[column_names]
+date_visit = "Date Visit"
+consume_department = "Consume Department"
+code = "Code"
+qty = "Qty"
+
+[departments]
+"[ER] Emergency" = "[205] Emergency"
+"[HEMO] Hemodialysis Centre" = "[218] Hemodialysis Centre"
+"[XRAY] Radiology Room" = "[XRAY] Radiology Room"
+"[CU11] Checkup" = "[CHK] Checkup"
+"[211M] OPD MED" = "[211] OPD MED"
+"[S111] Surgery" = "[S111] Surgery"
+"[Y111] TRUE C INSTITUTE" = "[211E] TRUE C INSTITUTE"
+"[G111] Obstetrical & Gynecology" = "[OBST] Obstetrical & Gynecology"
+"[C111] Pediatric" = "[211C] Pediatric"
+"[4W] WARD 4" = "[4W] WARD 5"
+"[C222] Well Baby" = "[211W] Well Baby"
+"[K111] Skin Dept." = "[K111] Skin Dept."
+"[101] Foreign Countries" = "[101] Foreign Countries"
+"[PT] Physical Therapy" = "[PT] Physical Therapy"
+"[O111] Orthopedic" = "[S222] Orthopedic"
+"[OR] Operation Room" = "[208] Operation Room"
+"[NS] Nursery" = "[NS] Nursery"
+"[ICU] ICU" = "[ICU] ICU"
+"[PP] Post Pratum" = "[PP] Post Pratum"
+"[5W] WARD 5" = "[5W] WARD 6"
+"[6W] WARD 6" = "[6W] WARD 7"
+"[SGI] GI SCOPE" = "[SGI] GI SCOPE"
+"[DNT] DENTAL" = "[213] DENTAL"
+"[PHA] Pharmacy Room I" = "[105] Pharmacy Room I"
+"[CATH] CATH LAB" = "[245] CATH LAB"
+
+[[products]]
+id = "2010100256"
+display_name = "GLOVE DISPOSABLE SIZE XS/PAIR(คู่)@"
+unit = "PAIR"
+subunit = "PAIR"
+factor = "1"
+track_subunits = false
+
+[[products]]
+id = "2010100255"
+display_name = "GLOVE DISPOSABLE SIZE S/PAIR(คู่)"
+unit = "PAIR"
+subunit = "PAIR"
+factor = "1"
+track_subunits = false
+
+[[products]]
+id = "2010100254"
+display_name = "GLOVE DISPOSABLE SIZE M/PAIR(คู่)@"
+unit = "PAIR"
+subunit = "PAIR"
+factor = "1"
+track_subunits = false
+
+[[products]]
+id = "2010100253"
+display_name = "GLOVE DISPOSABLE SIZE L/PAIR(คู่)@"
+unit = "PAIR"
+subunit = "PAIR"
+factor = "1"
+track_subunits = false
+
+[[products]]
+id = "2010101323"
+display_name = "ET SHEATH ปลอกหุ้ม DIGITAL THERMOMETER TERUMO (ซองปรอท)@"
+unit = "PC"
+subunit = "PC"
+factor = "1"
+track_subunits = false
+
+[[products]]
+id = "1161106077"
+display_name = "Chlorhexidine 2% in alcohol 30ml"
+unit = "BOT"
+subunit = "BOT"
+factor = "1"
+track_subunits = false
+
+[[products]]
+id = "ABN2100177"
+display_name = "MICROPORE 1\" ตัดแบ่งเป็น CM(**)"
+unit = "ROLL"
+subunit = "CM."
+factor = "900"
+track_subunits = true
+
+[[products]]
+id = "ABN2100178"
+display_name = "MICROPORE 1/2\" ตัดแบ่งเป็น CM(**)"
+unit = "ROLL"
+subunit = "CM."
+factor = "900"
+track_subunits = true
+
+[[products]]
+id = "ABN2100179"
+display_name = "MICROPORE 1\" (มีที่ตัด) ตัดแบ่งเป็น CM(**)"
+unit = "ROLL"
+subunit = "CM."
+factor = "900"
+track_subunits = true
+
+[[products]]
+id = "ABN2100180"
+display_name = "MICROPORE 1/2\" (มีที่ตัด) ตัดแบ่งเป็น CM(**)"
+unit = "ROLL"
+subunit = "CM."
+factor = "900"
+track_subunits = true
+
+[[products]]
+id = "ABN2100176"
+display_name = "INNOTAPE (SILICONE TAPE) 2.5CM ตัดแบ่ง 5 CM(**)"
+unit = "ROLL"
+subunit = "5 CM."
+factor = "30"
+track_subunits = true
+
+[[products]]
+id = "ABN2100175"
+display_name = "Disposible sheet laminate 80X200cm."
+unit = "PC"
+subunit = "PC"
+factor = "1"
+track_subunits = false
+
+[[products]]
+id = "ABN2100240"
+display_name = "Antiseptic Tower/แผ่น ( No Alcohol )"
+unit = "PC"
+subunit = "PC"
+factor = "1"
+track_subunits = false
+
+[[products]]
+id = "ABN2100298"
+display_name = "Antiseptic Towel /แผ่น"
+unit = "PC"
+subunit = "PC"
+factor = "1"
+track_subunits = false
+
+[[products]]
+id = "ABN2100302"
+display_name = "Chlorhexidine 2% in water 15 ml (คิดเงิน)"
+unit = "15 ml"
+subunit = "15 ml"
+factor = "1"
+track_subunits = false
