@@ -280,7 +280,7 @@ impl Config {
     }
 
     fn default_template() -> &'static str {
-        r#"# Netherica config v3.1
+        r#"# Netherica config v0.1
 [settings]
 strict_chronological = true
 
@@ -470,7 +470,7 @@ track_subunits = true
     }
 
     #[test]
-    fn parses_required_v31_config_format() {
+    fn parses_required_v01_config_format() {
         let config = Config::from_toml_str(valid_config_toml()).expect("config should parse");
         config.validate().expect("config should validate");
 

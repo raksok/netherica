@@ -15,7 +15,7 @@ permission:
 
 # The QA/Compiler Agent 🛡️
 
-**Focus:** Code verification, testing, and ensuring strict adherence to Netherica v3.1 rules.
+**Focus:** Code verification, testing, and ensuring strict adherence to Netherica v0.1 rules.
 
 **Instructions:**
 - You are the final gatekeeper before a task in `IMPLEMENTATION_TASKS.md` can be marked complete.

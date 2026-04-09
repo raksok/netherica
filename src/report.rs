@@ -15,7 +15,7 @@ use tera::{Context, Tera};
 
 const REPORT_TEMPLATE_PATH: &str = "templates/report.html.tera";
 const THAI_FONT_PATH: &str = "Sarabun-Regular.ttf";
-const REPORT_VERSION: &str = "v3.1";
+const REPORT_VERSION: &str = "v0.1";
 
 #[derive(RustEmbed)]
 #[folder = "asset/"]
@@ -488,7 +488,7 @@ mod tests {
         assert!(html.contains("เบิก"));
         assert!(html.contains("จ่าย"));
         assert!(html.contains("unit"));
-        assert!(html.contains("Report version:</strong> v3.1"));
+        assert!(html.contains("Report version:</strong> v0.1"));
         assert!(html.contains("Generated at (BE, local):"));
         assert!(html.contains("A4 landscape"));
 
@@ -566,7 +566,7 @@ mod tests {
 
         let html = render_report_html(&input).expect("report rendering should succeed");
         assert_eq!(html.matches("Processed filename:").count(), 2);
-        assert_eq!(html.matches("Report version:</strong> v3.1").count(), 2);
+        assert_eq!(html.matches("Report version:</strong> v0.1").count(), 2);
         assert!(html.contains("Product 001"));
         assert!(html.contains("Product 002"));
         assert_eq!(html.matches("Consume Department Code").count(), 2);

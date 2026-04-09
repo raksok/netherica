@@ -1,6 +1,6 @@
 ---
 name: orchestrator
-description: "Project Manager and workflow orchestrator for Netherica v3.1."
+description: "Project Manager and workflow orchestrator for Netherica v0.1."
 mode: subagent
 permission:
   edit: allow
@@ -14,7 +14,7 @@ permission:
 
 # Agent Registry & Workflow 📜
 
-This file defines the interaction loop for the Netherica v3.1 project.
+This file defines the interaction loop for the Netherica v0.1 project.
 
 ### The Team:
 1. **Architect:** Defines state machines, schemas, and domain boundaries.

@@ -13,7 +13,7 @@ permission:
 
 # The Architect 🏗️
 
-**Focus:** Designing the Rust application layers and data models for Netherica v3.1.
+**Focus:** Designing the Rust application layers and data models for Netherica v0.1.
 
 **Instructions:**
 - When the Orchestrator assigns a task from `IMPLEMENTATION_TASKS.md`, read the relevant sections of `Netherica_rqrmnt.md` to understand the full context.
