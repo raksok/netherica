@@ -7,10 +7,13 @@ Most of it written in opencode. Main coder is Gemma 4 26B A4B UD-IQ3_S limit con
 When Gemma 4 can't handle the task, the task is handed over to GPT-5.3 Codex (high) which also handle debugging.
 
 **The process of creating follow**
+
+```
 ┌─────────────┐   ┌───────────┐   ┌─────────────┐   ┌────────────────┐
 │   Written   │──→│   LLMs    │──→│  Opencode   │──→│    Opencode    │
 │ Requirements│   │ Rewritten │   │ coding loop │   │ Refinement loop│
 └─────────────┘   └───────────┘   └─────────────┘   └────────────────┘
+```
 
 - I'm start drafting written requirement by hand first. The requirements is fueled by my rage and deep hatred toward the inablity of people to do their job properly. Legacy system output report with number as TEXT, but product ID as an INTEGER losing leading 0 inthe process. People who pull report not fixing it before passing it to clerk. Clerk who only start a month ago, still under training, need handheld thorughout the process of turning it to report, then left when become competent enough to be autonomy.
 
