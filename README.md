@@ -28,7 +28,7 @@ When Gemma 4 can't handle the task, the task is handed over to GPT-5.3 Codex (hi
 
 - Next, to ensure the models did not slack off, which they often do. Main agent run `REQUIREMENTS.md` against codebase one more time, flag every missing requirement with [MISSING] along with source filename and line number, then created new phase in `TASKS.md` to fix all [MISSING] task and start the 3 agents loop again.
 
-- Finally, human (me) inspection, is the workflow behave as intended, is the UI look alright, did the report formatted as I want, whatever I find unsatisfactory will be patched into `REQUIREMENTS.md` and `TASKS.md` then let the 3 agents fix it again.
+- Finally, human (me) inspection, if the workflow behave as intended, is the UI look alright, did the report formatted as I want, whatever I find unsatisfactory will be patched into `REQUIREMENTS.md` and `TASKS.md` then let the 3 agents fix it again.
 
 The rest is LLMs generated. Basically, you will be able to compile this just fine with rust MSVC on Windows (YOYO if you're using MYSYS or MINGW) Linux version compiled and test on Fedora 43 KDE with stable rustup and development-tools group installed.
 
