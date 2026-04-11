@@ -39,6 +39,82 @@ fn configure_egui_fonts(ctx: &egui::Context) {
     ctx.set_fonts(build_font_definitions_with_utf8_support());
 }
 
+fn apply_design_system(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    let mut visuals = egui::Visuals::dark();
+
+    // 1. Spacing & Layout
+    // Spacing scale 2 (base 4px). item_spacing = space-3 (12px), window_margin = space-6 (24px)
+    style.spacing.item_spacing = egui::vec2(12.0, 12.0);
+    style.spacing.window_margin = egui::Margin::same(24.0);
+    style.spacing.button_padding = egui::vec2(16.0, 8.0);
+    
+    // 2. Color Tokens (Nordic Precision - The Arctic Atelier)
+    let primary = egui::Color32::from_rgb(163, 220, 236); // #a3dcec
+    let surface_container_lowest = egui::Color32::from_rgb(8, 14, 25); // #080e19
+    let surface = egui::Color32::from_rgb(13, 19, 30); // #0d131e
+    let surface_container_low = egui::Color32::from_rgb(22, 28, 39); // #161c27
+    let surface_container = egui::Color32::from_rgb(26, 32, 43); // #1a202b
+    let surface_container_high = egui::Color32::from_rgb(36, 42, 54); // #242a36
+    
+    let on_surface = egui::Color32::from_rgb(221, 226, 242); // #dde2f2
+    let on_surface_variant = egui::Color32::from_rgb(192, 200, 203); // #c0c8cb
+    let on_primary = egui::Color32::from_rgb(0, 54, 64); // #003640
+    
+    let outline_variant_40 = egui::Color32::from_rgba_premultiplied(64, 72, 75, 102); // 40% focus ghost border
+    
+    // Backgrounds
+    visuals.window_fill = surface_container_low; // Panels/windows sit on surface base
+    visuals.panel_fill = surface; // Base background
+    visuals.extreme_bg_color = surface_container_lowest; // Deep recesses, text inputs
+    visuals.faint_bg_color = surface_container_low;
+
+    // No-Line Rule
+    visuals.window_stroke = egui::Stroke::NONE;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
+    visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
+
+    // Widget colors & interactions
+    visuals.widgets.noninteractive.bg_fill = surface_container_low;
+    visuals.widgets.noninteractive.fg_stroke.color = on_surface_variant;
+    
+    visuals.widgets.inactive.bg_fill = surface_container; // Default cards/buttons
+    visuals.widgets.inactive.fg_stroke.color = on_surface;
+    
+    visuals.widgets.hovered.bg_fill = surface_container_high;
+    visuals.widgets.hovered.fg_stroke.color = on_surface;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, outline_variant_40); // Hover Ghost Border
+    
+    visuals.widgets.active.bg_fill = primary;
+    visuals.widgets.active.fg_stroke.color = on_primary;
+    
+    visuals.selection.bg_fill = primary;
+    visuals.selection.stroke.color = on_primary;
+
+    // Rounding & Elevation
+    let radius_md = 6.0; // Round-4 -> 6px for buttons/inputs
+    let radius_xl = 12.0; // 12px for windows/cards
+    visuals.widgets.noninteractive.rounding = egui::Rounding::same(radius_md);
+    visuals.widgets.inactive.rounding = egui::Rounding::same(radius_md);
+    visuals.widgets.hovered.rounding = egui::Rounding::same(radius_md);
+    visuals.widgets.active.rounding = egui::Rounding::same(radius_md);
+    visuals.window_rounding = egui::Rounding::same(radius_xl);
+
+    // Ambient Shadows (Tinted with black at 40%)
+    visuals.window_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(0.0, 24.0),
+        blur: 48.0,
+        spread: 0.0,
+        color: egui::Color32::from_rgba_premultiplied(0, 0, 0, 102),
+    };
+    visuals.popup_shadow = visuals.window_shadow;
+
+    style.visuals = visuals;
+    ctx.set_style(style);
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppState {
     Idle,
@@ -93,6 +169,7 @@ impl NethericaApp {
 
     pub fn new(_cc: &eframe::CreationContext<'_>, config: Config) -> Self {
         configure_egui_fonts(&_cc.egui_ctx);
+        apply_design_system(&_cc.egui_ctx);
 
         let mut app = Self::from_config(config);
 
@@ -607,6 +684,20 @@ impl eframe::App for NethericaApp {
         if self.receiver.is_some() {
             ctx.request_repaint();
         }
+
+        egui::SidePanel::left("left_panel")
+            .resizable(false)
+            .exact_width(240.0)
+            .show(ctx, |ui| {
+                ui.add_space(8.0);
+                ui.heading("Netherica");
+                ui.heading("Pharmacy Reconciliation");
+                ui.add_space(20.0);
+                let _ = ui.selectable_label(true, "Ingestion");
+                let _ = ui.selectable_label(false, "Reports");
+                let _ = ui.selectable_label(false, "Inventory");
+                let _ = ui.selectable_label(false, "Settings");
+            });
 
         egui::CentralPanel::default().show(ctx, |ui| {
             // Toast handling

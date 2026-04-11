@@ -4,7 +4,7 @@ use crate::error::{AppError, AppResult};
 use crate::models::{FileHistory, LedgerEntry, LedgerRow};
 use crate::report::{self, ReportRenderInput};
 use crate::repository::Repository;
-use calamine::{open_workbook_auto, Data, Reader};
+use calamine::{open_workbook_auto, Data, DataType, Reader};
 use chrono::{DateTime, Datelike, Local, NaiveDate, NaiveDateTime, Timelike, Utc};
 use rust_decimal::Decimal;
 use sha2::{Digest, Sha256};
@@ -345,35 +345,35 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
                 continue;
             }
 
-            let date_str = row
+            let cell = row
                 .get(column_indexes.date_visit)
-                .and_then(cell_as_string)
-                .unwrap_or_default();
-            let transaction_date = if date_str.trim().is_empty() {
-                fallback_rows += 1;
-                warn!(
-                    sheet = %product.id,
-                    row_number = row_idx + 2,
-                    fallback_utc = %file_mtime_utc,
-                    "Date missing; using file modification timestamp as UTC fallback"
-                );
-                file_mtime_utc
-            } else {
-                match be_to_gregorian(&date_str) {
-                    Ok(value) => value,
-                    Err(_) => {
-                        fallback_rows += 1;
-                        warn!(
-                            sheet = %product.id,
-                            row_number = row_idx + 2,
-                            date = %date_str,
-                            fallback_utc = %file_mtime_utc,
-                            "Invalid Buddhist Era date; using file modification timestamp as UTC fallback"
-                        );
-                        file_mtime_utc
-                    }
+                .unwrap_or(&Data::Empty);
+            let transaction_date_result = extract_transaction_date(cell, file_mtime_utc);
+            let transaction_date = transaction_date_result.date();
+
+            match transaction_date_result {
+                DateExtractionResult::Extracted(_) => {
+                    tracing::debug!(sheet = %product.id, row_number = row_idx + 2, "Native date extracted");
                 }
-            };
+                DateExtractionResult::FallbackMissing(_) => {
+                    fallback_rows += 1;
+                    warn!(
+                        sheet = %product.id,
+                        row_number = row_idx + 2,
+                        fallback_utc = %file_mtime_utc,
+                        "Date missing; using file modification timestamp as UTC fallback"
+                    );
+                }
+                DateExtractionResult::FallbackUnparseable(_) => {
+                    fallback_rows += 1;
+                    warn!(
+                        sheet = %product.id,
+                        row_number = row_idx + 2,
+                        fallback_utc = %file_mtime_utc,
+                        "Date unparseable; using file modification timestamp as UTC fallback"
+                    );
+                }
+            }
 
             earliest = Some(match earliest {
                 Some(current) => current.min(transaction_date),
@@ -457,6 +457,96 @@ pub fn be_to_gregorian(input: &str) -> AppResult<DateTime<Utc>> {
         .ok_or_else(|| AppError::ExcelError(format!("Invalid time in datetime: {input}")))?;
 
     Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
+#[derive(Debug, PartialEq)]
+pub enum DateExtractionResult {
+    Extracted(DateTime<Utc>),
+    FallbackMissing(DateTime<Utc>),
+    FallbackUnparseable(DateTime<Utc>),
+}
+
+impl DateExtractionResult {
+    pub fn date(&self) -> DateTime<Utc> {
+        match self {
+            Self::Extracted(dt) => *dt,
+            Self::FallbackMissing(dt) => *dt,
+            Self::FallbackUnparseable(dt) => *dt,
+        }
+    }
+
+    pub fn is_fallback(&self) -> bool {
+        matches!(self, Self::FallbackMissing(_) | Self::FallbackUnparseable(_))
+    }
+}
+
+fn apply_be_heuristic(naive: NaiveDateTime) -> DateTime<Utc> {
+    let mut dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+    if dt.year() > 2400 {
+        let new_year = dt.year() - 543;
+        if let Some(new_date) = NaiveDate::from_ymd_opt(new_year, dt.month(), dt.day()) {
+            if let Some(new_naive) = new_date.and_hms_opt(dt.hour(), dt.minute(), dt.second()) {
+                let adjusted = DateTime::<Utc>::from_naive_utc_and_offset(new_naive, Utc);
+                tracing::warn!(
+                    original_year = dt.year(),
+                    adjusted_year = adjusted.year(),
+                    "Native Date formatted cell contained a Buddhist Era year. Applied -543 heuristic correction."
+                );
+                dt = adjusted;
+            }
+        }
+    }
+    dt
+}
+
+pub fn extract_transaction_date(cell: &Data, file_mtime: DateTime<Utc>) -> DateExtractionResult {
+    match cell {
+        Data::Empty => return DateExtractionResult::FallbackMissing(file_mtime),
+        Data::DateTime(excel_dt) => {
+            if let Some(naive) = excel_dt.as_datetime() {
+                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+            }
+        }
+        Data::DateTimeIso(iso_str) => {
+            if let Ok(naive) = NaiveDateTime::parse_from_str(iso_str.trim(), "%Y-%m-%dT%H:%M:%S") {
+                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+            }
+        }
+        Data::Float(serial) => {
+            let dt = calamine::ExcelDateTime::new(*serial, calamine::ExcelDateTimeType::DateTime, false);
+            if let Some(naive) = dt.as_datetime() {
+                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+            }
+        }
+        Data::String(s) => {
+            if let Ok(dt) = be_to_gregorian(s) {
+                return DateExtractionResult::Extracted(dt);
+            }
+            if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%dT%H:%M:%S") {
+                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+            }
+            if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S") {
+                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+            }
+            if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M") {
+                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+            }
+            if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%d/%m/%Y %H:%M") {
+                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+            }
+        }
+        _ => {}
+    }
+    
+    if let Some(naive) = cell.as_datetime() {
+        return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+    }
+
+    if let Data::String(_) = cell {
+        DateExtractionResult::FallbackUnparseable(file_mtime)
+    } else {
+        DateExtractionResult::FallbackMissing(file_mtime)
+    }
 }
 
 #[cfg(test)]
@@ -2079,5 +2169,103 @@ mod tests {
         assert_eq!(parsed.rows[0].product_id, "P001");
         assert_eq!(parsed.rows[0].department_id, "ER");
         assert_eq!(parsed.rows[0].dispensed_amount, Decimal::new(2, 0));
+    }
+
+    #[test]
+    fn extract_transaction_date_handles_all_cell_types() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workbook_path = temp.path().join("date_parsing.xlsx");
+        let file_mtime = Utc::now();
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("ParseDate").unwrap();
+
+        // 1. Text string in BE format: "01-04-2569 08:00" -> expected 2026-04-01 08:00 UTC
+        sheet.write_string(0, 0, "01-04-2569 08:00").unwrap();
+
+        // 2. Native Excel datetime written using rust_xlsxwriter's ExcelDateTime
+        let dt_native = rust_xlsxwriter::ExcelDateTime::parse_from_str("2026-04-01T08:00:00").unwrap();
+        sheet.write_datetime(1, 0, &dt_native).unwrap();
+
+        // 3. Excel serial number as float (approximation of 2026-04-01 08:00)
+        // 46113.333333333
+        let serial_val: f64 = 46113.333333333336;
+        sheet.write_number(2, 0, serial_val).unwrap();
+
+        // 4. ISO string
+        sheet.write_string(3, 0, "2026-04-01T08:00:00").unwrap();
+
+        // 5. Empty cell
+        // Nothing written at row 4
+
+        // 6. Invalid string
+        sheet.write_string(5, 0, "not-a-date").unwrap();
+
+        workbook.save(&workbook_path).expect("workbook should be saved");
+
+        // Parse with calamine
+        let mut reader = calamine::open_workbook_auto(&workbook_path).expect("open fails");
+        let sheet_names = reader.sheet_names().to_vec();
+        let range = reader.worksheet_range(&sheet_names[0]).expect("range fails");
+
+        let expected_naive = NaiveDateTime::parse_from_str("2026-04-01T08:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let expected_utc = DateTime::<Utc>::from_naive_utc_and_offset(expected_naive, Utc);
+
+        // Verify 1: BE text string
+        let cell0 = range.get((0, 0)).unwrap_or(&Data::Empty);
+        let res0 = extract_transaction_date(cell0, file_mtime);
+        assert!(!res0.is_fallback());
+        assert_eq!(res0.date(), expected_utc);
+
+        // Verify 2: Native Excel DateTime
+        let cell1 = range.get((1, 0)).unwrap_or(&Data::Empty);
+        let res1 = extract_transaction_date(cell1, file_mtime);
+        assert!(!res1.is_fallback());
+        assert_eq!(res1.date(), expected_utc);
+
+        // Verify 3: Float serial
+        let cell2 = range.get((2, 0)).unwrap_or(&Data::Empty);
+        let res2 = extract_transaction_date(cell2, file_mtime);
+        assert!(!res2.is_fallback());
+        assert_eq!(res2.date().timestamp(), expected_utc.timestamp()); 
+
+        // Verify 4: ISO string
+        let cell3 = range.get((3, 0)).unwrap_or(&Data::Empty);
+        let res3 = extract_transaction_date(cell3, file_mtime);
+        assert!(!res3.is_fallback());
+        assert_eq!(res3.date(), expected_utc);
+
+        // Verify 5: Empty cell (Fallback to file_mtime)
+        let cell4 = range.get((4, 0)).unwrap_or(&Data::Empty);
+        let res4 = extract_transaction_date(cell4, file_mtime);
+        assert!(res4.is_fallback());
+        assert!(matches!(res4, DateExtractionResult::FallbackMissing(_)));
+        assert_eq!(res4.date(), file_mtime);
+
+        // Verify 6: Invalid string (Fallback to file_mtime)
+        let cell5 = range.get((5, 0)).unwrap_or(&Data::Empty);
+        let res5 = extract_transaction_date(cell5, file_mtime);
+        assert!(res5.is_fallback());
+        assert!(matches!(res5, DateExtractionResult::FallbackUnparseable(_)));
+        assert_eq!(res5.date(), file_mtime);
+    }
+
+    #[test]
+    fn extract_transaction_date_applies_be_heuristic_on_native_dates() {
+        let file_mtime = Utc::now();
+
+        // Simulate a cell with an ISO date string that has a Buddhist Era year (>2400)
+        let iso_str_be = "2569-04-01T08:00:00";
+        let cell = Data::DateTimeIso(iso_str_be.to_string());
+        
+        // When extracted, the heuristic should intercept it and subtract 543 from the year
+        let res = extract_transaction_date(&cell, file_mtime);
+        
+        let expected_naive = NaiveDateTime::parse_from_str("2026-04-01T08:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let expected_utc = DateTime::<Utc>::from_naive_utc_and_offset(expected_naive, Utc);
+        
+        assert!(!res.is_fallback());
+        assert_eq!(res.date(), expected_utc);
     }
 }
