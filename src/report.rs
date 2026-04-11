@@ -48,6 +48,14 @@ struct ReportTemplateRow {
     total_subunits_used: String,
     whole_units_output: String,
     closing_leftover: String,
+    #[serde(skip)]
+    opening_leftover_val: Decimal,
+    #[serde(skip)]
+    total_subunits_used_val: Decimal,
+    #[serde(skip)]
+    whole_units_output_val: Decimal,
+    #[serde(skip)]
+    closing_leftover_val: Decimal,
     department_rows: Vec<ReportTemplateDepartmentRow>,
 }
 
@@ -86,51 +94,68 @@ pub fn render_report_html(input: &ReportRenderInput) -> AppResult<String> {
             .then_with(|| a.department_id.cmp(&b.department_id))
     });
 
-    let rows = ordered_rows
-        .iter()
-        .map(|row| {
-            let product_meta = input.product_metadata.get(&row.product_id);
-            let product_display_name = product_meta
-                .map(|meta| meta.display_name.clone())
-                .filter(|name| !name.trim().is_empty())
-                .or_else(|| {
-                    (!row.product_display_name.trim().is_empty())
-                        .then_some(row.product_display_name.clone())
-                })
-                .unwrap_or_else(|| "-".to_string());
-            let unit = product_meta
-                .map(|meta| meta.unit.clone())
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| "-".to_string());
+    let mut rows: Vec<ReportTemplateRow> = Vec::new();
+    for row in ordered_rows.iter() {
+        let product_meta = input.product_metadata.get(&row.product_id);
+        let product_display_name = product_meta
+            .map(|meta| meta.display_name.clone())
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                (!row.product_display_name.trim().is_empty())
+                    .then_some(row.product_display_name.clone())
+            })
+            .unwrap_or_else(|| "-".to_string());
+        let unit = product_meta
+            .map(|meta| meta.unit.clone())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "-".to_string());
 
-            let consume_department_code = input
-                .department_metadata
-                .get(&row.department_id)
-                .cloned()
-                .unwrap_or_else(|| row.department_display_name.clone());
+        let consume_department_code = input
+            .department_metadata
+            .get(&row.department_id)
+            .cloned()
+            .unwrap_or_else(|| row.department_display_name.clone());
 
-            let department_rows = vec![ReportTemplateDepartmentRow {
-                consume_department_code,
-                product_name: product_display_name.clone(),
-                opening_leftover: decimal_to_string(row.opening_leftover),
-                borrowed: String::new(),
-                dispensed: decimal_to_string(row.total_subunits_used),
-                issued: String::new(),
-                unit: unit.clone(),
-            }];
+        let department_row = ReportTemplateDepartmentRow {
+            consume_department_code,
+            product_name: product_display_name.clone(),
+            opening_leftover: decimal_to_string(row.opening_leftover),
+            borrowed: String::new(),
+            dispensed: decimal_to_string(row.total_subunits_used),
+            issued: String::new(),
+            unit: unit.clone(),
+        };
 
-            ReportTemplateRow {
+        if let Some(existing) = rows.iter_mut().find(|r| r.product_id == row.product_id) {
+            existing.department_rows.push(department_row);
+            existing.opening_leftover_val += row.opening_leftover;
+            existing.total_subunits_used_val += row.total_subunits_used;
+            existing.whole_units_output_val += row.whole_units_output;
+            existing.closing_leftover_val += row.closing_leftover;
+        } else {
+            rows.push(ReportTemplateRow {
                 product_id: row.product_id.clone(),
-                product_display_name,
+                product_display_name: product_display_name.clone(),
                 unit,
                 opening_leftover: decimal_to_string(row.opening_leftover),
                 total_subunits_used: decimal_to_string(row.total_subunits_used),
                 whole_units_output: decimal_to_string(row.whole_units_output),
                 closing_leftover: decimal_to_string(row.closing_leftover),
-                department_rows,
-            }
-        })
-        .collect::<Vec<_>>();
+                opening_leftover_val: row.opening_leftover,
+                total_subunits_used_val: row.total_subunits_used,
+                whole_units_output_val: row.whole_units_output,
+                closing_leftover_val: row.closing_leftover,
+                department_rows: vec![department_row],
+            });
+        }
+    }
+
+    for row in rows.iter_mut() {
+        row.opening_leftover = decimal_to_string(row.opening_leftover_val);
+        row.total_subunits_used = decimal_to_string(row.total_subunits_used_val);
+        row.whole_units_output = decimal_to_string(row.whole_units_output_val);
+        row.closing_leftover = decimal_to_string(row.closing_leftover_val);
+    }
 
     let department_totals = aggregate_department_totals(&input.rows)
         .into_iter()
@@ -721,6 +746,17 @@ mod tests {
         assert!(html.contains("Intensive Care"));
         assert!(html.contains("Emergency"));
         assert!(html.contains("Ward"));
+
+        assert_eq!(
+            html.matches("Processed filename:").count(),
+            1,
+            "single product P001 should have one page with all departments"
+        );
+        assert_eq!(
+            html.matches("<p class=\"product-id\">P001</p>").count(),
+            1,
+            "P001 should appear exactly once as product-id"
+        );
 
         let er_idx = html.find("Emergency").expect("ER row should appear");
         let icu_idx = html.find("Intensive Care").expect("ICU row should appear");
