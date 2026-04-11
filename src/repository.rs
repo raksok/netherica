@@ -19,12 +19,13 @@ impl<'a> Repository<'a> {
 
     pub fn insert_file_history(&self, tx: &Transaction<'a>, entry: &FileHistory) -> AppResult<()> {
         tx.execute(
-            "INSERT INTO file_history (file_hash, filename, file_size, transaction_date) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO file_history (file_hash, filename, file_size, transaction_date, period_end) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 entry.file_hash,
                 entry.filename,
                 entry.file_size,
-                entry.transaction_date.to_rfc3339()
+                entry.transaction_date.to_rfc3339(),
+                entry.period_end.to_rfc3339(),
             ],
         )
         .map_err(AppError::DatabaseError)?;
@@ -61,9 +62,29 @@ impl<'a> Repository<'a> {
         }
     }
 
+    pub fn get_max_ledger_transaction_date(&self) -> AppResult<Option<DateTime<Utc>>> {
+        let date_str: Option<String> = self
+            .db
+            .connection()
+            .query_row(
+                "SELECT MAX(transaction_date) FROM inventory_ledger",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(AppError::DatabaseError)?;
+
+        match date_str {
+            Some(s) => Ok(Some(parse_utc_db_datetime(&s)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn get_latest_file_hash(&self) -> AppResult<Option<String>> {
         let res = self.db.connection().query_row(
-            "SELECT file_hash FROM file_history ORDER BY transaction_date DESC, processed_at DESC LIMIT 1",
+            "SELECT file_hash
+             FROM file_history
+             ORDER BY COALESCE(period_end, transaction_date) DESC, processed_at DESC
+             LIMIT 1",
             [],
             |row| row.get(0),
         );
@@ -77,22 +98,32 @@ impl<'a> Repository<'a> {
 
     pub fn get_file_history_by_hash(&self, hash: &str) -> AppResult<Option<FileHistory>> {
         let res = self.db.connection().query_row(
-            "SELECT file_hash, filename, file_size, transaction_date FROM file_history WHERE file_hash = ?1",
+            "SELECT file_hash,
+                    filename,
+                    file_size,
+                    transaction_date,
+                    COALESCE(period_end, transaction_date)
+             FROM file_history
+             WHERE file_hash = ?1",
             params![hash],
             |row| {
                 let file_hash: String = row.get(0)?;
                 let filename: String = row.get(1)?;
                 let file_size: i64 = row.get(2)?;
                 let transaction_date_str: String = row.get(3)?;
+                let period_end_str: String = row.get(4)?;
 
-                let transaction_date =
-                    parse_utc_db_datetime(&transaction_date_str).map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let transaction_date = parse_utc_db_datetime(&transaction_date_str)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let period_end = parse_utc_db_datetime(&period_end_str)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
                 Ok(FileHistory {
                     file_hash,
                     filename,
                     file_size,
                     transaction_date,
+                    period_end,
                 })
             },
         );
@@ -496,14 +527,21 @@ mod tests {
     use tempfile::tempdir;
 
     fn sample_file_history(file_hash: &str) -> FileHistory {
+        let period_start = Utc
+            .with_ymd_and_hms(2026, 4, 1, 8, 0, 0)
+            .single()
+            .expect("timestamp should be valid");
+        let period_end = Utc
+            .with_ymd_and_hms(2026, 4, 1, 9, 0, 0)
+            .single()
+            .expect("timestamp should be valid");
+
         FileHistory {
             file_hash: file_hash.to_string(),
             filename: "sample.xlsx".to_string(),
             file_size: 128,
-            transaction_date: Utc
-                .with_ymd_and_hms(2026, 4, 1, 8, 0, 0)
-                .single()
-                .expect("timestamp should be valid"),
+            transaction_date: period_start,
+            period_end,
         }
     }
 
@@ -581,6 +619,91 @@ mod tests {
                 .expect("product total query should succeed"),
             Decimal::new(2, 0)
         );
+
+        let history = repo
+            .get_file_history_by_hash(file_hash)
+            .expect("file history lookup should succeed")
+            .expect("file history should exist");
+        assert_eq!(
+            history.transaction_date,
+            sample_file_history(file_hash).transaction_date
+        );
+        assert_eq!(
+            history.period_end,
+            sample_file_history(file_hash).period_end
+        );
+    }
+
+    #[test]
+    fn get_latest_file_hash_orders_by_period_end_desc() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let first_hash = "range-first";
+        let second_hash = "range-second";
+
+        let first_history = FileHistory {
+            file_hash: first_hash.to_string(),
+            filename: "first.xlsx".to_string(),
+            file_size: 12,
+            transaction_date: Utc
+                .with_ymd_and_hms(2026, 4, 1, 0, 0, 0)
+                .single()
+                .expect("timestamp should be valid"),
+            period_end: Utc
+                .with_ymd_and_hms(2026, 4, 10, 0, 0, 0)
+                .single()
+                .expect("timestamp should be valid"),
+        };
+        let first_entries = vec![LedgerEntry {
+            product_id: "P001".to_string(),
+            department_id: "ER".to_string(),
+            dispensed_amount: Decimal::new(1, 0),
+            transaction_date: Utc
+                .with_ymd_and_hms(2026, 4, 10, 8, 0, 0)
+                .single()
+                .expect("timestamp should be valid"),
+            file_hash: first_hash.to_string(),
+            borrowed_amount: Decimal::ZERO,
+        }];
+
+        let second_history = FileHistory {
+            file_hash: second_hash.to_string(),
+            filename: "second.xlsx".to_string(),
+            file_size: 13,
+            transaction_date: Utc
+                .with_ymd_and_hms(2026, 4, 5, 0, 0, 0)
+                .single()
+                .expect("timestamp should be valid"),
+            period_end: Utc
+                .with_ymd_and_hms(2026, 4, 5, 0, 0, 0)
+                .single()
+                .expect("timestamp should be valid"),
+        };
+        let second_entries = vec![LedgerEntry {
+            product_id: "P001".to_string(),
+            department_id: "ER".to_string(),
+            dispensed_amount: Decimal::new(1, 0),
+            transaction_date: Utc
+                .with_ymd_and_hms(2026, 4, 5, 8, 0, 0)
+                .single()
+                .expect("timestamp should be valid"),
+            file_hash: second_hash.to_string(),
+            borrowed_amount: Decimal::ZERO,
+        }];
+
+        repo.commit_ingestion_batch(&first_history, &first_entries)
+            .expect("first commit should succeed");
+        repo.commit_ingestion_batch(&second_history, &second_entries)
+            .expect("second commit should succeed");
+
+        let latest = repo
+            .get_latest_file_hash()
+            .expect("latest file hash query should succeed")
+            .expect("latest file hash should exist");
+        assert_eq!(latest, first_hash);
     }
 
     #[test]

@@ -79,7 +79,7 @@ pub fn prepare_ingestion_dry_run(
 
     let parsed = parse_excel_file(file_path, config)?;
 
-    if let Some(existing_max) = repository.get_max_transaction_date()? {
+    if let Some(existing_max) = repository.get_max_ledger_transaction_date()? {
         let new_date = parsed.earliest_transaction_utc;
         if new_date <= existing_max {
             return Err(AppError::ChronologicalViolation {
@@ -154,6 +154,7 @@ pub fn commit_prepared_ingestion(
         filename: pending.filename.clone(),
         file_size: pending.file_size,
         transaction_date: pending.transaction_date,
+        period_end: pending.period_end,
     };
 
     repository.commit_ingestion_batch(&file_history, &pending.ledger_entries)?;
@@ -1039,6 +1040,7 @@ mod tests {
                 filename: "seed.xlsx".to_string(),
                 file_size: 1,
                 transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+                period_end: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
             },
             &[LedgerEntry {
                 product_id: "P001".to_string(),
@@ -1126,6 +1128,7 @@ mod tests {
                 filename: "prior.xlsx".to_string(),
                 file_size: 10,
                 transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+                period_end: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
             },
             &[LedgerEntry {
                 product_id: "P001".to_string(),
@@ -1559,6 +1562,161 @@ mod tests {
     }
 
     #[test]
+    fn chronology_rejects_overlapping_file_ranges_based_on_ledger_max() {
+        let temp = tempdir().expect("tempdir should be created");
+        let input_dir = temp.path().join("input");
+        let archive_dir = temp.path().join("archive");
+        let reports_dir = temp.path().join("reports");
+        fs::create_dir_all(&input_dir).expect("input dir should be created");
+
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(10, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let first_file = input_dir.join("first_span.xlsx");
+        write_excel(
+            &first_file,
+            &[
+                RowInput {
+                    date_visit_be: "01-04-2569 08:00",
+                    department: "ER",
+                    code: "P001",
+                    qty: 25,
+                },
+                RowInput {
+                    date_visit_be: "10-04-2569 08:00",
+                    department: "ER",
+                    code: "P001",
+                    qty: 5,
+                },
+            ],
+        );
+        ingest_excel_file(&first_file, &config, &repo, &archive_dir, &reports_dir)
+            .expect("first spanning file should ingest successfully");
+
+        let overlapping_file = input_dir.join("overlap.xlsx");
+        write_excel(
+            &overlapping_file,
+            &[RowInput {
+                date_visit_be: "05-04-2569 08:00",
+                department: "ER",
+                code: "P001",
+                qty: 10,
+            }],
+        );
+
+        let result = ingest_excel_file(
+            &overlapping_file,
+            &config,
+            &repo,
+            &archive_dir,
+            &reports_dir,
+        );
+        assert!(matches!(
+            result,
+            Err(AppError::ChronologicalViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn later_file_opening_leftover_matches_prior_report_closing_leftover() {
+        let temp = tempdir().expect("tempdir should be created");
+        let input_dir = temp.path().join("input");
+        let archive_dir = temp.path().join("archive");
+        let reports_dir = temp.path().join("reports");
+        fs::create_dir_all(&input_dir).expect("input dir should be created");
+
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(10, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let first_file = input_dir.join("continuity_first.xlsx");
+        write_excel(
+            &first_file,
+            &[RowInput {
+                date_visit_be: "01-04-2569 08:00",
+                department: "ER",
+                code: "P001",
+                qty: 25,
+            }],
+        );
+
+        let first = ingest_excel_file(&first_file, &config, &repo, &archive_dir, &reports_dir)
+            .expect("first file should ingest successfully");
+
+        let first_entries = repo
+            .get_ledger_entries_by_file_hash(&first.file_hash)
+            .expect("first file entries should be queryable");
+        let first_period_start = first_entries
+            .iter()
+            .map(|entry| entry.transaction_date)
+            .min()
+            .expect("first file should have at least one entry");
+        let first_rows = report::build_report_rows_for_entries(
+            &repo,
+            &config,
+            &first_entries,
+            first_period_start,
+        )
+        .expect("first report rows should build");
+
+        assert_eq!(first_rows.len(), 1);
+        let first_closing = first_rows[0].closing_leftover;
+        assert_eq!(first_closing, Decimal::new(5, 0));
+
+        let second_file = input_dir.join("continuity_second.xlsx");
+        write_excel(
+            &second_file,
+            &[RowInput {
+                date_visit_be: "02-04-2569 08:00",
+                department: "ER",
+                code: "P001",
+                qty: 10,
+            }],
+        );
+
+        let pending = prepare_ingestion_dry_run(&second_file, &config, &repo)
+            .expect("dry run should succeed");
+        assert_eq!(pending.dry_run_rows.len(), 1);
+        assert_eq!(pending.dry_run_rows[0].department_id, "ER");
+        assert_eq!(pending.dry_run_rows[0].opening_leftover, first_closing);
+    }
+
+    #[test]
     fn duplicate_detection_uses_hash_across_different_paths() {
         let temp = tempdir().expect("tempdir should be created");
         let input_dir = temp.path().join("input");
@@ -1862,6 +2020,7 @@ mod tests {
                 filename: "seed.xlsx".to_string(),
                 file_size: 1,
                 transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+                period_end: Utc.with_ymd_and_hms(2026, 4, 1, 10, 0, 0).single().unwrap(),
             },
             &[LedgerEntry {
                 product_id: "P001".to_string(),
@@ -2152,6 +2311,10 @@ mod tests {
             filename: "seed.xlsx".to_string(),
             file_size: 0,
             transaction_date: seed_date
+                .and_hms_opt(0, 0, 0)
+                .expect("valid seed datetime")
+                .and_utc(),
+            period_end: seed_date
                 .and_hms_opt(0, 0, 0)
                 .expect("valid seed datetime")
                 .and_utc(),
@@ -2569,9 +2732,26 @@ mod tests {
                 .with_ymd_and_hms(2100, 1, 1, 0, 0, 0)
                 .single()
                 .expect("valid date"),
+            period_end: Utc
+                .with_ymd_and_hms(2100, 1, 1, 0, 0, 0)
+                .single()
+                .expect("valid date"),
         };
-        repo.commit_ingestion_batch(&existing_history, &[])
-            .expect("seed history should insert");
+        repo.commit_ingestion_batch(
+            &existing_history,
+            &[LedgerEntry {
+                product_id: "P001".to_string(),
+                department_id: "ER".to_string(),
+                dispensed_amount: Decimal::ONE,
+                transaction_date: Utc
+                    .with_ymd_and_hms(2100, 1, 1, 0, 0, 0)
+                    .single()
+                    .expect("valid date"),
+                file_hash: "existing".to_string(),
+                borrowed_amount: Decimal::ZERO,
+            }],
+        )
+        .expect("seed history should insert");
 
         let file = input_dir.join("invalid_date_rows.xlsx");
         write_excel(

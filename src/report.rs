@@ -798,6 +798,11 @@ mod tests {
                     .and_hms_opt(0, 0, 0)
                     .unwrap()
                     .and_utc(),
+                period_end: chrono::NaiveDate::from_ymd_opt(2026, 4, 1)
+                    .unwrap()
+                    .and_hms_opt(9, 0, 0)
+                    .unwrap()
+                    .and_utc(),
             },
             &[LedgerEntry {
                 product_id: "P001".to_string(),
@@ -822,6 +827,11 @@ mod tests {
                 transaction_date: chrono::NaiveDate::from_ymd_opt(2026, 4, 2)
                     .unwrap()
                     .and_hms_opt(0, 0, 0)
+                    .unwrap()
+                    .and_utc(),
+                period_end: chrono::NaiveDate::from_ymd_opt(2026, 4, 2)
+                    .unwrap()
+                    .and_hms_opt(11, 0, 0)
                     .unwrap()
                     .and_utc(),
             },
@@ -926,6 +936,7 @@ mod tests {
                 filename: "prior.xlsx".to_string(),
                 file_size: 10,
                 transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+                period_end: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
             },
             &[LedgerEntry {
                 product_id: "P001".to_string(),
@@ -995,6 +1006,7 @@ mod tests {
                 filename: "prior.xlsx".to_string(),
                 file_size: 10,
                 transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+                period_end: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
             },
             &[LedgerEntry {
                 product_id: "P001".to_string(),
@@ -1067,6 +1079,7 @@ mod tests {
                 filename: "prior_factor_one.xlsx".to_string(),
                 file_size: 10,
                 transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+                period_end: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
             },
             &[LedgerEntry {
                 product_id: "P001".to_string(),

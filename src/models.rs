@@ -8,6 +8,7 @@ pub struct FileHistory {
     pub filename: String,
     pub file_size: i64,
     pub transaction_date: DateTime<Utc>,
+    pub period_end: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

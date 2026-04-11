@@ -63,6 +63,12 @@ const MIGRATIONS: &[(u32, &str)] = &[
         );
         ",
     ),
+    (
+        4,
+        "
+        ALTER TABLE file_history ADD COLUMN period_end DATETIME;
+        ",
+    ),
 ];
 
 const LATEST_SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -127,6 +133,16 @@ fn apply_migrations(conn: &Connection) -> AppResult<()> {
             }
         }
 
+        if *target_version == 4 {
+            if let Err(e) = migrate_file_history_period_end_v4(&tx) {
+                let _ = tx.rollback();
+                return Err(AppError::InternalError(format!(
+                    "Migration to version {} failed during period_end backfill: {}",
+                    target_version, e
+                )));
+            }
+        }
+
         if let Err(e) = tx.pragma_update(None, "user_version", target_version) {
             let _ = tx.rollback();
             return Err(AppError::InternalError(format!(
@@ -186,6 +202,40 @@ fn migrate_product_totals_v2(tx: &Transaction<'_>) -> AppResult<()> {
     }
 
     backfill_product_totals_from_ledger(tx)
+}
+
+fn migrate_file_history_period_end_v4(tx: &Transaction<'_>) -> AppResult<()> {
+    tx.execute_batch(
+        "
+        UPDATE file_history
+        SET period_end = COALESCE(
+            (
+                SELECT MAX(transaction_date)
+                FROM inventory_ledger
+                WHERE inventory_ledger.file_hash = file_history.file_hash
+            ),
+            transaction_date
+        )
+        WHERE period_end IS NULL;
+        ",
+    )
+    .map_err(AppError::DatabaseError)?;
+
+    let remaining_nulls: i64 = tx
+        .query_row(
+            "SELECT COUNT(1) FROM file_history WHERE period_end IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(AppError::DatabaseError)?;
+
+    if remaining_nulls != 0 {
+        return Err(AppError::InternalError(
+            "period_end backfill left NULL values in file_history".to_string(),
+        ));
+    }
+
+    Ok(())
 }
 
 fn has_legacy_product_totals_schema(tx: &Transaction<'_>) -> AppResult<bool> {
@@ -683,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_to_v3_and_adds_borrowed_amount_column() {
+    fn migrates_v2_to_v4_and_adds_borrowed_amount_column() {
         let temp = tempdir().expect("tempdir should be created");
         let db_path = temp.path().join("state.db");
 
@@ -725,11 +775,11 @@ mod tests {
         .expect("seed v2 schema should be created");
         drop(conn);
 
-        let db = Database::new(&db_path).expect("database should migrate from v2 to v3");
+        let db = Database::new(&db_path).expect("database should migrate from v2 to v4");
         let conn = db.connection();
 
         let user_version = get_user_version(conn).expect("must read user_version");
-        assert_eq!(user_version, 3, "user_version should be 3 after migration");
+        assert_eq!(user_version, 4, "user_version should be 4 after migration");
 
         // Verify borrowed_amount column exists and has default value '0'
         let borrowed_amount: String = conn
@@ -747,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_v2_to_v3_and_creates_borrowed_carryover_table() {
+    fn migrates_v2_to_v4_and_creates_borrowed_carryover_table() {
         let temp = tempdir().expect("tempdir should be created");
         let db_path = temp.path().join("state.db");
 
@@ -785,11 +835,11 @@ mod tests {
         .expect("seed v2 schema should be created");
         drop(conn);
 
-        let db = Database::new(&db_path).expect("database should migrate from v2 to v3");
+        let db = Database::new(&db_path).expect("database should migrate from v2 to v4");
         let conn = db.connection();
 
         let user_version = get_user_version(conn).expect("must read user_version");
-        assert_eq!(user_version, 3, "user_version should be 3 after migration");
+        assert_eq!(user_version, 4, "user_version should be 4 after migration");
 
         // Verify borrowed_carryover table exists
         let table_exists: i64 = conn
@@ -865,5 +915,83 @@ mod tests {
             .expect("should query amount");
 
         assert_eq!(amount, "10.5", "should retrieve inserted amount");
+    }
+
+    #[test]
+    fn migrates_v3_to_v4_backfills_file_history_period_end() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+
+        let conn = Connection::open(&db_path).expect("connection should open");
+        conn.execute_batch(
+            "
+            CREATE TABLE file_history (
+                file_hash TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                transaction_date DATETIME NOT NULL,
+                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE inventory_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_hash TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                department_id TEXT NOT NULL,
+                dispensed_amount TEXT NOT NULL,
+                transaction_date DATETIME NOT NULL,
+                borrowed_amount TEXT NOT NULL DEFAULT '0',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(file_hash) REFERENCES file_history(file_hash)
+            );
+            CREATE TABLE product_totals (
+                product_id TEXT NOT NULL,
+                department_id TEXT NOT NULL,
+                total_sum TEXT NOT NULL,
+                PRIMARY KEY (product_id, department_id)
+            );
+            CREATE TABLE borrowed_carryover (
+                product_id TEXT NOT NULL,
+                department_id TEXT NOT NULL,
+                amount TEXT NOT NULL DEFAULT '0',
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (product_id, department_id)
+            );
+            INSERT INTO file_history (file_hash, filename, file_size, transaction_date)
+            VALUES
+                ('f1', 'first.xlsx', 10, '2026-04-01T00:00:00+00:00'),
+                ('f2', 'second.xlsx', 10, '2026-04-02T00:00:00+00:00');
+            INSERT INTO inventory_ledger (file_hash, product_id, department_id, dispensed_amount, transaction_date, borrowed_amount)
+            VALUES
+                ('f1', 'P001', 'ER', '1', '2026-04-01T08:00:00+00:00', '0'),
+                ('f1', 'P001', 'ER', '1', '2026-04-01T09:30:00+00:00', '0');
+            PRAGMA user_version = 3;
+            ",
+        )
+        .expect("seed v3 schema should be created");
+        drop(conn);
+
+        let db = Database::new(&db_path).expect("database should migrate from v3 to v4");
+        let conn = db.connection();
+
+        let user_version = get_user_version(conn).expect("must read user_version");
+        assert_eq!(user_version, 4, "user_version should be 4 after migration");
+
+        let f1_period_end: String = conn
+            .query_row(
+                "SELECT period_end FROM file_history WHERE file_hash = 'f1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("f1 period_end should be backfilled");
+        assert_eq!(f1_period_end, "2026-04-01T09:30:00+00:00");
+
+        let f2_period_end: String = conn
+            .query_row(
+                "SELECT period_end FROM file_history WHERE file_hash = 'f2'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("f2 period_end should be backfilled");
+        assert_eq!(f2_period_end, "2026-04-02T00:00:00+00:00");
     }
 }
