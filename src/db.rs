@@ -49,6 +49,20 @@ const MIGRATIONS: &[(u32, &str)] = &[
         CREATE INDEX IF NOT EXISTS idx_ledger_file_hash ON inventory_ledger(file_hash);
         ",
     ),
+    (
+        3,
+        "
+        ALTER TABLE inventory_ledger ADD COLUMN borrowed_amount TEXT NOT NULL DEFAULT '0';
+
+        CREATE TABLE IF NOT EXISTS borrowed_carryover (
+            product_id TEXT NOT NULL,
+            department_id TEXT NOT NULL,
+            amount TEXT NOT NULL DEFAULT '0',
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (product_id, department_id)
+        );
+        ",
+    ),
 ];
 
 const LATEST_SCHEMA_VERSION: u32 = MIGRATIONS.len() as u32;
@@ -666,5 +680,190 @@ mod tests {
         };
         let msg = err.to_string();
         assert!(msg.contains("Migration to version 2 failed"));
+    }
+
+    #[test]
+    fn migrates_v2_to_v3_and_adds_borrowed_amount_column() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+
+        let conn = Connection::open(&db_path).expect("connection should open");
+        conn.execute_batch(
+            "
+            CREATE TABLE file_history (
+                file_hash TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                transaction_date DATETIME NOT NULL,
+                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE inventory_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_hash TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                department_id TEXT NOT NULL,
+                dispensed_amount TEXT NOT NULL,
+                transaction_date DATETIME NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(file_hash) REFERENCES file_history(file_hash)
+            );
+            CREATE TABLE product_totals (
+                product_id TEXT NOT NULL,
+                department_id TEXT NOT NULL,
+                total_sum TEXT NOT NULL,
+                PRIMARY KEY (product_id, department_id)
+            );
+            CREATE INDEX idx_ledger_product_department_date ON inventory_ledger(product_id, department_id, transaction_date);
+            CREATE INDEX idx_ledger_file_hash ON inventory_ledger(file_hash);
+            INSERT INTO file_history (file_hash, filename, file_size, transaction_date)
+            VALUES ('f1', 'a.xlsx', 10, '2026-04-01T00:00:00+00:00');
+            INSERT INTO inventory_ledger (file_hash, product_id, department_id, dispensed_amount, transaction_date)
+            VALUES ('f1', 'P001', 'ER', '3', '2026-04-01T08:00:00+00:00');
+            PRAGMA user_version = 2;
+            ",
+        )
+        .expect("seed v2 schema should be created");
+        drop(conn);
+
+        let db = Database::new(&db_path).expect("database should migrate from v2 to v3");
+        let conn = db.connection();
+
+        let user_version = get_user_version(conn).expect("must read user_version");
+        assert_eq!(user_version, 3, "user_version should be 3 after migration");
+
+        // Verify borrowed_amount column exists and has default value '0'
+        let borrowed_amount: String = conn
+            .query_row(
+                "SELECT borrowed_amount FROM inventory_ledger WHERE product_id = 'P001'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("should query borrowed_amount");
+
+        assert_eq!(
+            borrowed_amount, "0",
+            "borrowed_amount should default to '0' for existing rows"
+        );
+    }
+
+    #[test]
+    fn migrates_v2_to_v3_and_creates_borrowed_carryover_table() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+
+        let conn = Connection::open(&db_path).expect("connection should open");
+        conn.execute_batch(
+            "
+            CREATE TABLE file_history (
+                file_hash TEXT PRIMARY KEY,
+                filename TEXT NOT NULL,
+                file_size INTEGER NOT NULL,
+                transaction_date DATETIME NOT NULL,
+                processed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE inventory_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_hash TEXT NOT NULL,
+                product_id TEXT NOT NULL,
+                department_id TEXT NOT NULL,
+                dispensed_amount TEXT NOT NULL,
+                transaction_date DATETIME NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(file_hash) REFERENCES file_history(file_hash)
+            );
+            CREATE TABLE product_totals (
+                product_id TEXT NOT NULL,
+                department_id TEXT NOT NULL,
+                total_sum TEXT NOT NULL,
+                PRIMARY KEY (product_id, department_id)
+            );
+            CREATE INDEX idx_ledger_product_department_date ON inventory_ledger(product_id, department_id, transaction_date);
+            CREATE INDEX idx_ledger_file_hash ON inventory_ledger(file_hash);
+            PRAGMA user_version = 2;
+            ",
+        )
+        .expect("seed v2 schema should be created");
+        drop(conn);
+
+        let db = Database::new(&db_path).expect("database should migrate from v2 to v3");
+        let conn = db.connection();
+
+        let user_version = get_user_version(conn).expect("must read user_version");
+        assert_eq!(user_version, 3, "user_version should be 3 after migration");
+
+        // Verify borrowed_carryover table exists
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(1) FROM sqlite_master WHERE type='table' AND name='borrowed_carryover'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("must query sqlite_master");
+        assert_eq!(table_exists, 1, "borrowed_carryover table should exist");
+
+        // Verify expected columns exist
+        let columns: Vec<(String, String, Option<String>, i64)> = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(borrowed_carryover)")
+                .expect("prepare should succeed");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(1)?,         // name
+                        row.get::<_, String>(2)?,         // type
+                        row.get::<_, Option<String>>(4)?, // dflt_value (can be NULL)
+                        row.get::<_, i64>(5)?,            // pk
+                    ))
+                })
+                .expect("query should succeed");
+            let mut data = Vec::new();
+            for row in rows {
+                data.push(row.expect("row should decode"));
+            }
+            data
+        };
+
+        // Verify column names and types
+        let column_map: std::collections::HashMap<String, (String, Option<String>, i64)> = columns
+            .into_iter()
+            .map(|(name, col_type, dflt, pk)| (name, (col_type, dflt, pk)))
+            .collect();
+
+        assert_eq!(
+            column_map.get("product_id"),
+            Some(&("TEXT".to_string(), None, 1)),
+            "product_id should be TEXT and part of primary key"
+        );
+        assert_eq!(
+            column_map.get("department_id"),
+            Some(&("TEXT".to_string(), None, 2)),
+            "department_id should be TEXT and part of primary key"
+        );
+        assert_eq!(
+            column_map.get("amount"),
+            Some(&("TEXT".to_string(), Some("'0'".to_string()), 0)),
+            "amount should be TEXT with default '0'"
+        );
+        assert!(
+            column_map.contains_key("updated_at"),
+            "updated_at column should exist"
+        );
+
+        // Verify we can insert and query from the table
+        conn.execute(
+            "INSERT INTO borrowed_carryover (product_id, department_id, amount) VALUES (?1, ?2, ?3)",
+            params!["P001", "ER", "10.5"],
+        )
+        .expect("insert should succeed");
+
+        let amount: String = conn
+            .query_row(
+                "SELECT amount FROM borrowed_carryover WHERE product_id = 'P001' AND department_id = 'ER'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("should query amount");
+
+        assert_eq!(amount, "10.5", "should retrieve inserted amount");
     }
 }

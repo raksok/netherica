@@ -27,7 +27,7 @@ fn main() -> AppResult<()> {
     };
 
     eframe::run_native(
-        "Netherica v0.1",
+        "Netherica v0.2.2",
         native_options,
         Box::new(move |cc| {
             // Initialize the app state

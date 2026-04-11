@@ -117,11 +117,6 @@
 
     .summary-item strong { font-weight: 700; }
 
-    .blank-value {
-      color: transparent;
-      user-select: none;
-    }
-
     .report-footer {
       margin-top: 8px;
       font-size: 10px;
@@ -212,14 +207,14 @@
         </tbody>
       </table>
 
-      <div class="summary-lines">
-        <div class="summary-item"><span>ยอดยกมา (รวม)</span><strong>{{ row.opening_leftover }}</strong></div>
-        <div class="summary-item"><span>ขอยืม</span><strong class="blank-value">&nbsp;</strong></div>
-        <div class="summary-item"><span>เบิก (รวม)</span><strong>{{ row.total_subunits_used }}</strong></div>
-        <div class="summary-item"><span>จ่าย</span><strong class="blank-value">&nbsp;</strong></div>
-        <div class="summary-item"><span>Whole Units Output</span><strong>{{ row.whole_units_output }}</strong></div>
-        <div class="summary-item"><span>Closing Leftover</span><strong>{{ row.closing_leftover }}</strong></div>
-      </div>
+        <div class="summary-lines">
+          <div class="summary-item"><span>ยอดยกมา (รวม)</span><strong>{{ row.opening_leftover }}</strong></div>
+          <div class="summary-item"><span>ขอยืม</span><strong>&nbsp;</strong></div>
+          <div class="summary-item"><span>เบิก (รวม)</span><strong>{{ row.total_subunits_used }}</strong></div>
+          <div class="summary-item"><span>จ่าย (รวม)</span><strong>{{ row.total_issued }}</strong></div>
+          <div class="summary-item"><span>Whole Units Output</span><strong>{{ row.whole_units_output }}</strong></div>
+          <div class="summary-item"><span>Closing Leftover</span><strong>{{ row.closing_leftover }}</strong></div>
+        </div>
 
       <footer class="report-footer">
         <span><strong>Generated at (BE):</strong> {{ generated_at_be_local }}</span>

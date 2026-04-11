@@ -106,6 +106,7 @@ pub fn prepare_ingestion_dry_run(
             dispensed_amount: row.dispensed_amount,
             transaction_date: row.transaction_date,
             file_hash: file_hash.clone(),
+            borrowed_amount: Decimal::ZERO,
         })
         .collect::<Vec<_>>();
 
@@ -163,6 +164,9 @@ pub fn commit_prepared_ingestion(
         &pending.ledger_entries,
         pending.period_start,
     )?;
+
+    let carryover_updates = build_borrowed_carryover_updates(&report_rows);
+    repository.upsert_borrowed_carryover_batch(&carryover_updates)?;
 
     let report_input = ReportRenderInput {
         source_filename: pending.filename.clone(),
@@ -626,6 +630,18 @@ fn build_dry_run_rows(
             (opening_leftover, whole_units_output, closing_leftover)
         };
 
+        if factor <= Decimal::ZERO {
+            return Err(AppError::DomainError(format!(
+                "Invalid factor {} for product '{}'",
+                factor, product_id
+            )));
+        }
+
+        let carry_over_borrowed = repository.get_borrowed_carryover(&product_id, &department_id)?;
+        let ingested_borrowed = Decimal::ZERO;
+        let net_subunits = total_subunits_used - carry_over_borrowed - ingested_borrowed;
+        let issued = (net_subunits / factor).floor();
+
         let department_display_name = config
             .departments
             .get(&department_id)
@@ -638,13 +654,35 @@ fn build_dry_run_rows(
             department_id,
             department_display_name,
             opening_leftover,
+            borrowed: carry_over_borrowed,
             total_subunits_used,
+            issued,
             whole_units_output,
             closing_leftover,
         });
     }
 
     Ok(result)
+}
+
+fn build_borrowed_carryover_updates(rows: &[DryRunRow]) -> Vec<(String, String, Decimal)> {
+    rows.iter()
+        .map(|row| {
+            let ingested_borrowed = Decimal::ZERO;
+            let net_subunits = row.total_subunits_used - row.borrowed - ingested_borrowed;
+            let new_carryover = if net_subunits < Decimal::ZERO {
+                -net_subunits
+            } else {
+                Decimal::ZERO
+            };
+
+            (
+                row.product_id.clone(),
+                row.department_id.clone(),
+                new_carryover,
+            )
+        })
+        .collect()
 }
 
 fn euclidean_mod(a: Decimal, n: Decimal) -> AppResult<Decimal> {
@@ -1005,6 +1043,7 @@ mod tests {
                 dispensed_amount: Decimal::new(7, 0),
                 transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
                 file_hash: "seed".to_string(),
+                borrowed_amount: Decimal::ZERO,
             }],
         )
         .expect("seed ingestion should succeed");
@@ -1069,6 +1108,184 @@ mod tests {
         assert_eq!(row.closing_leftover, Decimal::ZERO);
         assert_eq!(row.total_subunits_used, Decimal::new(4, 0));
         assert_eq!(row.whole_units_output, Decimal::new(4, 0));
+    }
+
+    #[test]
+    fn commit_persists_negative_issued_carryover() {
+        let temp = tempdir().expect("tempdir should be created");
+        let input_dir = temp.path().join("input");
+        let archive_dir = temp.path().join("archive");
+        let reports_dir = temp.path().join("reports");
+        fs::create_dir_all(&input_dir).expect("input dir should be created");
+
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        repo.upsert_borrowed_carryover_batch(&[(
+            "P001".to_string(),
+            "ER".to_string(),
+            Decimal::new(7, 0),
+        )])
+        .expect("carryover seed should succeed");
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(2, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let source_file_path = input_dir.join("negative_issue.xlsx");
+        fs::write(&source_file_path, "placeholder").expect("source file should exist");
+        let tx_date = Utc.with_ymd_and_hms(2026, 4, 3, 8, 0, 0).single().unwrap();
+
+        let pending = PendingIngestionCommit {
+            source_file_path,
+            file_hash: "hash_negative".to_string(),
+            filename: "negative_issue.xlsx".to_string(),
+            file_size: 11,
+            transaction_date: tx_date,
+            ledger_entries: vec![LedgerEntry {
+                product_id: "P001".to_string(),
+                department_id: "ER".to_string(),
+                dispensed_amount: Decimal::new(3, 0),
+                transaction_date: tx_date,
+                file_hash: "hash_negative".to_string(),
+                borrowed_amount: Decimal::ZERO,
+            }],
+            dry_run_rows: vec![],
+            period_start: tx_date,
+            period_end: tx_date,
+            product_metadata: BTreeMap::from([(
+                "P001".to_string(),
+                report::ReportProductMetadata {
+                    display_name: "Product 001".to_string(),
+                    unit: "Box".to_string(),
+                },
+            )]),
+            department_metadata: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+            transaction_date_fallback_used: false,
+            transaction_date_warning: None,
+        };
+
+        let report_rows = report::build_report_rows_for_entries(
+            &repo,
+            &config,
+            &pending.ledger_entries,
+            pending.period_start,
+        )
+        .expect("report rows should build");
+        assert_eq!(report_rows.len(), 1);
+        assert_eq!(report_rows[0].issued, Decimal::new(-2, 0));
+
+        let outcome =
+            commit_prepared_ingestion(&pending, &config, &repo, &reports_dir, &archive_dir)
+                .expect("commit should succeed");
+        assert!(outcome.report_path.exists());
+
+        let updated = repo
+            .get_borrowed_carryover("P001", "ER")
+            .expect("carryover query should succeed");
+        assert_eq!(updated, Decimal::new(4, 0));
+    }
+
+    #[test]
+    fn commit_clears_carryover_when_consumed() {
+        let temp = tempdir().expect("tempdir should be created");
+        let input_dir = temp.path().join("input");
+        let archive_dir = temp.path().join("archive");
+        let reports_dir = temp.path().join("reports");
+        fs::create_dir_all(&input_dir).expect("input dir should be created");
+
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        repo.upsert_borrowed_carryover_batch(&[(
+            "P001".to_string(),
+            "ER".to_string(),
+            Decimal::new(4, 0),
+        )])
+        .expect("carryover seed should succeed");
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(2, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let source_file_path = input_dir.join("consume_carryover.xlsx");
+        fs::write(&source_file_path, "placeholder").expect("source file should exist");
+        let tx_date = Utc.with_ymd_and_hms(2026, 4, 4, 8, 0, 0).single().unwrap();
+
+        let pending = PendingIngestionCommit {
+            source_file_path,
+            file_hash: "hash_consumed".to_string(),
+            filename: "consume_carryover.xlsx".to_string(),
+            file_size: 11,
+            transaction_date: tx_date,
+            ledger_entries: vec![LedgerEntry {
+                product_id: "P001".to_string(),
+                department_id: "ER".to_string(),
+                dispensed_amount: Decimal::new(10, 0),
+                transaction_date: tx_date,
+                file_hash: "hash_consumed".to_string(),
+                borrowed_amount: Decimal::ZERO,
+            }],
+            dry_run_rows: vec![],
+            period_start: tx_date,
+            period_end: tx_date,
+            product_metadata: BTreeMap::from([(
+                "P001".to_string(),
+                report::ReportProductMetadata {
+                    display_name: "Product 001".to_string(),
+                    unit: "Box".to_string(),
+                },
+            )]),
+            department_metadata: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+            transaction_date_fallback_used: false,
+            transaction_date_warning: None,
+        };
+
+        let report_rows = report::build_report_rows_for_entries(
+            &repo,
+            &config,
+            &pending.ledger_entries,
+            pending.period_start,
+        )
+        .expect("report rows should build");
+        assert_eq!(report_rows.len(), 1);
+        assert_eq!(report_rows[0].issued, Decimal::new(3, 0));
+
+        commit_prepared_ingestion(&pending, &config, &repo, &reports_dir, &archive_dir)
+            .expect("commit should succeed");
+
+        let updated = repo
+            .get_borrowed_carryover("P001", "ER")
+            .expect("carryover query should succeed");
+        assert_eq!(updated, Decimal::ZERO);
     }
 
     #[test]
@@ -1561,6 +1778,7 @@ mod tests {
                 dispensed_amount: Decimal::new(3, 0),
                 transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 10, 0, 0).single().unwrap(),
                 file_hash: "seed-review".to_string(),
+                borrowed_amount: Decimal::ZERO,
             }],
         )
         .expect("seed ingestion should succeed");
@@ -1863,6 +2081,7 @@ mod tests {
                     .expect("valid seed datetime")
                     .and_utc(),
                 file_hash: seed_hash.clone(),
+                borrowed_amount: Decimal::ZERO,
             });
         }
         repo.commit_ingestion_batch(&seed_file, &seed_entries)

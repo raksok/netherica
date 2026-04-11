@@ -280,7 +280,7 @@ impl Config {
     }
 
     fn default_template() -> &'static str {
-        r#"# Netherica config v0.1
+        r#"# Netherica config v0.2.2
 [settings]
 strict_chronological = true
 

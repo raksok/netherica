@@ -17,6 +17,7 @@ pub struct LedgerEntry {
     pub dispensed_amount: Decimal,
     pub transaction_date: DateTime<Utc>,
     pub file_hash: String,
+    pub borrowed_amount: Decimal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

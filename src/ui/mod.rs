@@ -765,7 +765,7 @@ impl eframe::App for NethericaApp {
                 self.post_generation_guidance = None;
             }
 
-            ui.heading("Netherica v0.1 - Ingestion System");
+            ui.heading("Netherica v0.2.2 - Ingestion System");
             ui.add_space(10.0);
 
             match self.state {

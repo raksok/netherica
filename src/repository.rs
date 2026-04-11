@@ -112,8 +112,8 @@ impl<'a> Repository<'a> {
         entries: &[LedgerEntry],
     ) -> AppResult<()> {
         let mut stmt = tx.prepare(
-            "INSERT INTO inventory_ledger (file_hash, product_id, department_id, dispensed_amount, transaction_date) 
-             VALUES (?1, ?2, ?3, ?4, ?5)"
+            "INSERT INTO inventory_ledger (file_hash, product_id, department_id, dispensed_amount, transaction_date, borrowed_amount) 
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
         ).map_err(AppError::DatabaseError)?;
 
         for entry in entries {
@@ -123,6 +123,7 @@ impl<'a> Repository<'a> {
                 entry.department_id,
                 entry.dispensed_amount.to_string(),
                 entry.transaction_date.to_rfc3339(),
+                entry.borrowed_amount.to_string(),
             ])
             .map_err(AppError::DatabaseError)?;
         }
@@ -200,7 +201,7 @@ impl<'a> Repository<'a> {
             .db
             .connection()
             .prepare(
-                "SELECT product_id, department_id, CAST(dispensed_amount AS TEXT), transaction_date, file_hash
+                "SELECT product_id, department_id, CAST(dispensed_amount AS TEXT), transaction_date, file_hash, CAST(borrowed_amount AS TEXT)
                  FROM inventory_ledger
                  WHERE file_hash = ?1
                  ORDER BY transaction_date ASC, id ASC",
@@ -214,11 +215,15 @@ impl<'a> Repository<'a> {
                 let dispensed_amount_str: String = row.get(2)?;
                 let transaction_date_str: String = row.get(3)?;
                 let file_hash: String = row.get(4)?;
+                let borrowed_amount_str: String = row.get(5)?;
 
                 let dispensed_amount = dispensed_amount_str
                     .parse::<Decimal>()
                     .map_err(|_| rusqlite::Error::InvalidQuery)?;
                 let transaction_date = parse_utc_db_datetime(&transaction_date_str)
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                let borrowed_amount = borrowed_amount_str
+                    .parse::<Decimal>()
                     .map_err(|_| rusqlite::Error::InvalidQuery)?;
 
                 Ok(LedgerEntry {
@@ -227,6 +232,7 @@ impl<'a> Repository<'a> {
                     dispensed_amount,
                     transaction_date,
                     file_hash,
+                    borrowed_amount,
                 })
             })
             .map_err(AppError::DatabaseError)?;
@@ -373,6 +379,72 @@ impl<'a> Repository<'a> {
         Ok(out)
     }
 
+    // --- Borrowed Carryover ---
+
+    /// Retrieves the borrowed carryover amount for a specific product and department.
+    /// Returns `Decimal::ZERO` if no record exists.
+    pub fn get_borrowed_carryover(
+        &self,
+        product_id: &str,
+        department_id: &str,
+    ) -> AppResult<Decimal> {
+        let res = self.db.connection().query_row(
+            "SELECT CAST(amount AS TEXT)
+             FROM borrowed_carryover
+             WHERE product_id = ?1 AND department_id = ?2",
+            params![product_id, department_id],
+            |row| row.get::<_, String>(0),
+        );
+
+        match res {
+            Ok(s) => s.parse::<Decimal>().map_err(|_| {
+                AppError::DomainError("Failed to parse quantity from database".to_string())
+            }),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(Decimal::ZERO),
+            Err(e) => Err(AppError::DatabaseError(e)),
+        }
+    }
+
+    /// Inserts or updates the borrowed carryover amount for a specific product and department.
+    /// Uses SQLite's INSERT ... ON CONFLICT DO UPDATE pattern.
+    /// Updates the `updated_at` timestamp on conflict.
+    pub fn upsert_borrowed_carryover(
+        &self,
+        tx: &Transaction<'a>,
+        product_id: &str,
+        department_id: &str,
+        amount: Decimal,
+    ) -> AppResult<()> {
+        tx.execute(
+            "INSERT INTO borrowed_carryover (product_id, department_id, amount)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(product_id, department_id)
+             DO UPDATE SET amount = excluded.amount, updated_at = CURRENT_TIMESTAMP",
+            params![product_id, department_id, amount.to_string()],
+        )
+        .map_err(AppError::DatabaseError)?;
+        Ok(())
+    }
+
+    /// Atomically upserts borrowed carryover amounts for multiple
+    /// (product_id, department_id) pairs.
+    pub fn upsert_borrowed_carryover_batch(
+        &self,
+        updates: &[(String, String, Decimal)],
+    ) -> AppResult<()> {
+        let tx = self
+            .db
+            .connection()
+            .unchecked_transaction()
+            .map_err(AppError::DatabaseError)?;
+
+        for (product_id, department_id, amount) in updates {
+            self.upsert_borrowed_carryover(&tx, product_id, department_id, *amount)?;
+        }
+
+        tx.commit().map_err(AppError::DatabaseError)
+    }
+
     pub fn get_nonzero_product_department_sums_before_date(
         &self,
         date: DateTime<Utc>,
@@ -446,6 +518,7 @@ mod tests {
                     .single()
                     .expect("timestamp should be valid"),
                 file_hash: file_hash.to_string(),
+                borrowed_amount: Decimal::ZERO,
             },
             LedgerEntry {
                 product_id: "P001".to_string(),
@@ -456,8 +529,23 @@ mod tests {
                     .single()
                     .expect("timestamp should be valid"),
                 file_hash: file_hash.to_string(),
+                borrowed_amount: Decimal::ZERO,
             },
         ]
+    }
+
+    fn sample_entries_with_borrowed(file_hash: &str) -> Vec<LedgerEntry> {
+        vec![LedgerEntry {
+            product_id: "P007".to_string(),
+            department_id: "WARD".to_string(),
+            dispensed_amount: Decimal::new(9, 0),
+            transaction_date: Utc
+                .with_ymd_and_hms(2026, 4, 2, 10, 30, 0)
+                .single()
+                .expect("timestamp should be valid"),
+            file_hash: file_hash.to_string(),
+            borrowed_amount: Decimal::new(125, 2),
+        }]
     }
 
     #[test]
@@ -493,6 +581,65 @@ mod tests {
                 .expect("product total query should succeed"),
             Decimal::new(2, 0)
         );
+    }
+
+    #[test]
+    fn batch_insert_ledger_persists_borrowed_amount_column() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let file_hash = "hash-borrowed-batch";
+        let history = sample_file_history(file_hash);
+        let entries = sample_entries_with_borrowed(file_hash);
+
+        let tx = db
+            .connection()
+            .unchecked_transaction()
+            .expect("transaction should start");
+        repo.insert_file_history(&tx, &history)
+            .expect("file history insert should succeed");
+        repo.batch_insert_ledger(&tx, &entries)
+            .expect("ledger batch insert should succeed");
+        tx.commit().expect("commit should succeed");
+
+        let borrowed_text: String = db
+            .connection()
+            .query_row(
+                "SELECT borrowed_amount FROM inventory_ledger WHERE file_hash = ?1",
+                params![file_hash],
+                |row| row.get(0),
+            )
+            .expect("borrowed_amount should be persisted");
+
+        assert_eq!(
+            borrowed_text,
+            Decimal::new(125, 2).to_string(),
+            "borrowed_amount must be written as decimal text"
+        );
+    }
+
+    #[test]
+    fn get_ledger_entries_by_file_hash_reads_borrowed_amount() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let file_hash = "hash-borrowed-read";
+        let history = sample_file_history(file_hash);
+        let entries = sample_entries_with_borrowed(file_hash);
+
+        repo.commit_ingestion_batch(&history, &entries)
+            .expect("commit should succeed");
+
+        let read_entries = repo
+            .get_ledger_entries_by_file_hash(file_hash)
+            .expect("ledger query should succeed");
+
+        assert_eq!(read_entries.len(), 1);
+        assert_eq!(read_entries[0].borrowed_amount, Decimal::new(125, 2));
     }
 
     #[test]
@@ -539,6 +686,132 @@ mod tests {
                 .expect("product total query should succeed"),
             Decimal::ZERO,
             "product_totals upsert must rollback"
+        );
+    }
+
+    // --- Borrowed Carryover Tests ---
+
+    #[test]
+    fn get_borrowed_carryover_returns_zero_when_no_record_exists() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let amount = repo
+            .get_borrowed_carryover("P001", "ER")
+            .expect("query should succeed");
+
+        assert_eq!(
+            amount,
+            Decimal::ZERO,
+            "should return zero when no record exists"
+        );
+    }
+
+    #[test]
+    fn upsert_borrowed_carryover_inserts_new_record() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let tx = db
+            .connection()
+            .unchecked_transaction()
+            .expect("transaction should start");
+        repo.upsert_borrowed_carryover(&tx, "P001", "ER", Decimal::new(15, 1))
+            .expect("upsert should succeed");
+        tx.commit().expect("commit should succeed");
+
+        let amount = repo
+            .get_borrowed_carryover("P001", "ER")
+            .expect("query should succeed");
+
+        assert_eq!(
+            amount,
+            Decimal::new(15, 1),
+            "should retrieve inserted amount"
+        );
+    }
+
+    #[test]
+    fn upsert_borrowed_carryover_updates_existing_record() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        // Insert initial record
+        let tx = db
+            .connection()
+            .unchecked_transaction()
+            .expect("transaction should start");
+        repo.upsert_borrowed_carryover(&tx, "P001", "ER", Decimal::new(10, 0))
+            .expect("first upsert should succeed");
+        tx.commit().expect("commit should succeed");
+
+        // Update the same record
+        let tx = db
+            .connection()
+            .unchecked_transaction()
+            .expect("transaction should start");
+        repo.upsert_borrowed_carryover(&tx, "P001", "ER", Decimal::new(25, 0))
+            .expect("second upsert should succeed");
+        tx.commit().expect("commit should succeed");
+
+        let amount = repo
+            .get_borrowed_carryover("P001", "ER")
+            .expect("query should succeed");
+
+        assert_eq!(
+            amount,
+            Decimal::new(25, 0),
+            "should retrieve updated amount (not cumulative)"
+        );
+    }
+
+    #[test]
+    fn borrowed_carryover_supports_multiple_product_department_pairs() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        // Insert multiple records
+        let tx = db
+            .connection()
+            .unchecked_transaction()
+            .expect("transaction should start");
+        repo.upsert_borrowed_carryover(&tx, "P001", "ER", Decimal::new(10, 0))
+            .expect("upsert should succeed");
+        repo.upsert_borrowed_carryover(&tx, "P001", "ICU", Decimal::new(20, 0))
+            .expect("upsert should succeed");
+        repo.upsert_borrowed_carryover(&tx, "P002", "ER", Decimal::new(30, 0))
+            .expect("upsert should succeed");
+        tx.commit().expect("commit should succeed");
+
+        // Verify each record independently
+        assert_eq!(
+            repo.get_borrowed_carryover("P001", "ER")
+                .expect("query should succeed"),
+            Decimal::new(10, 0)
+        );
+        assert_eq!(
+            repo.get_borrowed_carryover("P001", "ICU")
+                .expect("query should succeed"),
+            Decimal::new(20, 0)
+        );
+        assert_eq!(
+            repo.get_borrowed_carryover("P002", "ER")
+                .expect("query should succeed"),
+            Decimal::new(30, 0)
+        );
+        assert_eq!(
+            repo.get_borrowed_carryover("P002", "ICU")
+                .expect("query should succeed"),
+            Decimal::ZERO,
+            "non-existent record should return zero"
         );
     }
 }

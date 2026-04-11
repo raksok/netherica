@@ -8,7 +8,9 @@ pub struct DryRunRow {
     pub department_id: String,
     pub department_display_name: String,
     pub opening_leftover: Decimal,
+    pub borrowed: Decimal,
     pub total_subunits_used: Decimal,
+    pub issued: Decimal,
     pub whole_units_output: Decimal,
     pub closing_leftover: Decimal,
 }

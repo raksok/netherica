@@ -15,7 +15,7 @@ use tera::{Context, Tera};
 
 const REPORT_TEMPLATE_PATH: &str = "templates/report.html.tera";
 const THAI_FONT_PATH: &str = "Sarabun-Regular.ttf";
-const REPORT_VERSION: &str = "v0.1";
+const REPORT_VERSION: &str = "v0.2.2";
 
 #[derive(RustEmbed)]
 #[folder = "asset/"]
@@ -47,6 +47,7 @@ struct ReportTemplateRow {
     opening_leftover: String,
     total_subunits_used: String,
     whole_units_output: String,
+    total_issued: String,
     closing_leftover: String,
     #[serde(skip)]
     opening_leftover_val: Decimal,
@@ -54,6 +55,8 @@ struct ReportTemplateRow {
     total_subunits_used_val: Decimal,
     #[serde(skip)]
     whole_units_output_val: Decimal,
+    #[serde(skip)]
+    total_issued_val: Decimal,
     #[serde(skip)]
     closing_leftover_val: Decimal,
     department_rows: Vec<ReportTemplateDepartmentRow>,
@@ -67,6 +70,8 @@ struct ReportTemplateDepartmentRow {
     borrowed: String,
     dispensed: String,
     issued: String,
+    #[serde(skip)]
+    issued_val: Decimal,
     unit: String,
 }
 
@@ -122,7 +127,8 @@ pub fn render_report_html(input: &ReportRenderInput) -> AppResult<String> {
             opening_leftover: decimal_to_string(row.opening_leftover),
             borrowed: String::new(),
             dispensed: decimal_to_string(row.total_subunits_used),
-            issued: String::new(),
+            issued: decimal_to_string(row.issued),
+            issued_val: row.issued,
             unit: unit.clone(),
         };
 
@@ -131,6 +137,7 @@ pub fn render_report_html(input: &ReportRenderInput) -> AppResult<String> {
             existing.opening_leftover_val += row.opening_leftover;
             existing.total_subunits_used_val += row.total_subunits_used;
             existing.whole_units_output_val += row.whole_units_output;
+            existing.total_issued_val += row.issued;
             existing.closing_leftover_val += row.closing_leftover;
         } else {
             rows.push(ReportTemplateRow {
@@ -140,10 +147,12 @@ pub fn render_report_html(input: &ReportRenderInput) -> AppResult<String> {
                 opening_leftover: decimal_to_string(row.opening_leftover),
                 total_subunits_used: decimal_to_string(row.total_subunits_used),
                 whole_units_output: decimal_to_string(row.whole_units_output),
+                total_issued: decimal_to_string(row.issued),
                 closing_leftover: decimal_to_string(row.closing_leftover),
                 opening_leftover_val: row.opening_leftover,
                 total_subunits_used_val: row.total_subunits_used,
                 whole_units_output_val: row.whole_units_output,
+                total_issued_val: row.issued,
                 closing_leftover_val: row.closing_leftover,
                 department_rows: vec![department_row],
             });
@@ -154,6 +163,10 @@ pub fn render_report_html(input: &ReportRenderInput) -> AppResult<String> {
         row.opening_leftover = decimal_to_string(row.opening_leftover_val);
         row.total_subunits_used = decimal_to_string(row.total_subunits_used_val);
         row.whole_units_output = decimal_to_string(row.whole_units_output_val);
+        row.total_issued = decimal_to_string(row.total_issued_val);
+        for department_row in row.department_rows.iter_mut() {
+            department_row.issued = decimal_to_string(department_row.issued_val);
+        }
         row.closing_leftover = decimal_to_string(row.closing_leftover_val);
     }
 
@@ -427,6 +440,18 @@ pub fn build_report_rows_for_entries(
             (opening_leftover, whole_units_output, closing_leftover)
         };
 
+        if factor <= Decimal::ZERO {
+            return Err(AppError::DomainError(format!(
+                "Invalid factor {} for product '{}'",
+                factor, product_id
+            )));
+        }
+
+        let carry_over_borrowed = repository.get_borrowed_carryover(&product_id, &department_id)?;
+        let ingested_borrowed = Decimal::ZERO;
+        let net_subunits = total_subunits_used - carry_over_borrowed - ingested_borrowed;
+        let issued = (net_subunits / factor).floor();
+
         let department_display_name = config
             .departments
             .get(&department_id)
@@ -439,7 +464,9 @@ pub fn build_report_rows_for_entries(
             department_id,
             department_display_name,
             opening_leftover,
+            borrowed: carry_over_borrowed,
             total_subunits_used,
+            issued,
             whole_units_output,
             closing_leftover,
         });
@@ -481,7 +508,9 @@ mod tests {
                 department_id: "ICU".to_string(),
                 department_display_name: "Intensive Care".to_string(),
                 opening_leftover: Decimal::new(12, 1),
+                borrowed: Decimal::ZERO,
                 total_subunits_used: Decimal::new(125, 1),
+                issued: Decimal::ZERO,
                 whole_units_output: Decimal::new(15, 0),
                 closing_leftover: Decimal::new(0, 1),
             }],
@@ -514,7 +543,7 @@ mod tests {
         assert!(html.contains("เบิก"));
         assert!(html.contains("จ่าย"));
         assert!(html.contains("unit"));
-        assert!(html.contains("Report version:</strong> v0.1"));
+        assert!(html.contains("Report version:</strong> v0.2.2"));
         assert!(html.contains("Generated at (BE, local):"));
         assert!(html.contains("A4 landscape"));
 
@@ -540,7 +569,9 @@ mod tests {
                     department_id: "ICU".to_string(),
                     department_display_name: "Intensive Care".to_string(),
                     opening_leftover: Decimal::new(0, 0),
+                    borrowed: Decimal::ZERO,
                     total_subunits_used: Decimal::new(4, 0),
+                    issued: Decimal::ZERO,
                     whole_units_output: Decimal::new(4, 0),
                     closing_leftover: Decimal::new(0, 0),
                 },
@@ -550,7 +581,9 @@ mod tests {
                     department_id: "ER".to_string(),
                     department_display_name: "Emergency".to_string(),
                     opening_leftover: Decimal::new(1, 0),
+                    borrowed: Decimal::ZERO,
                     total_subunits_used: Decimal::new(2, 0),
+                    issued: Decimal::ZERO,
                     whole_units_output: Decimal::new(3, 0),
                     closing_leftover: Decimal::new(0, 0),
                 },
@@ -579,7 +612,7 @@ mod tests {
 
         let html = render_report_html(&input).expect("report rendering should succeed");
         assert_eq!(html.matches("Processed filename:").count(), 2);
-        assert_eq!(html.matches("Report version:</strong> v0.1").count(), 2);
+        assert_eq!(html.matches("Report version:</strong> v0.2.2").count(), 2);
         assert!(html.contains("Product 001"));
         assert!(html.contains("Product 002"));
         assert_eq!(html.matches("Consume Department Code").count(), 2);
@@ -600,8 +633,8 @@ mod tests {
             "borrow summary must remain blank when borrow flow is not processed"
         );
         assert!(
-            !html.contains("<span>จ่าย</span><strong>-</strong>"),
-            "issued summary must remain blank when borrow flow is not processed"
+            html.contains("<span>จ่าย (รวม)</span><strong>0</strong>"),
+            "issued summary should show computed total"
         );
     }
 
@@ -665,6 +698,7 @@ mod tests {
                     .unwrap()
                     .and_utc(),
                 file_hash: old_hash,
+                borrowed_amount: Decimal::ZERO,
             }],
         )
         .expect("older ingestion should commit");
@@ -691,6 +725,7 @@ mod tests {
                         .unwrap()
                         .and_utc(),
                     file_hash: latest_hash.clone(),
+                    borrowed_amount: Decimal::ZERO,
                 },
                 LedgerEntry {
                     product_id: "P001".to_string(),
@@ -702,6 +737,7 @@ mod tests {
                         .unwrap()
                         .and_utc(),
                     file_hash: latest_hash,
+                    borrowed_amount: Decimal::ZERO,
                 },
             ],
         )
@@ -786,6 +822,7 @@ mod tests {
                 dispensed_amount: Decimal::new(3, 0),
                 transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
                 file_hash: "prior".to_string(),
+                borrowed_amount: Decimal::ZERO,
             }],
         )
         .expect("seed should commit");
@@ -816,6 +853,7 @@ mod tests {
             dispensed_amount: Decimal::new(2, 0),
             transaction_date: Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
             file_hash: "current".to_string(),
+            borrowed_amount: Decimal::ZERO,
         }];
 
         let rows = build_report_rows_for_entries(
@@ -831,5 +869,58 @@ mod tests {
         assert_eq!(rows[1].department_id, "WARD");
         assert_eq!(rows[1].opening_leftover, Decimal::new(1, 0));
         assert_eq!(rows[1].total_subunits_used, Decimal::ZERO);
+    }
+
+    #[test]
+    fn report_builder_calculates_issued_with_floor_and_carry_over() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        repo.upsert_borrowed_carryover_batch(&[(
+            "P001".to_string(),
+            "ER".to_string(),
+            Decimal::new(1, 0),
+        )])
+        .expect("carryover seed should succeed");
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(2, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let entries = vec![LedgerEntry {
+            product_id: "P001".to_string(),
+            department_id: "ER".to_string(),
+            dispensed_amount: Decimal::new(5, 0),
+            transaction_date: Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
+            file_hash: "test_hash".to_string(),
+            borrowed_amount: Decimal::ZERO,
+        }];
+
+        let rows = build_report_rows_for_entries(
+            &repo,
+            &config,
+            &entries,
+            Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
+        )
+        .expect("report rows should build");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].borrowed, Decimal::new(1, 0));
+        assert_eq!(rows[0].issued, Decimal::new(2, 0));
     }
 }
