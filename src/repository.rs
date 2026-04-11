@@ -129,12 +129,23 @@ impl<'a> Repository<'a> {
         Ok(())
     }
 
-    pub fn sum_before_date(&self, product_id: &str, date: DateTime<Utc>) -> AppResult<Decimal> {
-        let sum_str: Option<String> = self.db.connection().query_row(
-            "SELECT CAST(SUM(dispensed_amount) AS TEXT) FROM inventory_ledger WHERE product_id = ?1 AND transaction_date < ?2",
-            params![product_id, date.to_rfc3339()],
-            |row| row.get(0),
-        ).map_err(AppError::DatabaseError)?;
+    pub fn sum_before_date_for_product_department(
+        &self,
+        product_id: &str,
+        department_id: &str,
+        date: DateTime<Utc>,
+    ) -> AppResult<Decimal> {
+        let sum_str: Option<String> = self
+            .db
+            .connection()
+            .query_row(
+                "SELECT CAST(SUM(dispensed_amount) AS TEXT)
+             FROM inventory_ledger
+             WHERE product_id = ?1 AND department_id = ?2 AND transaction_date < ?3",
+                params![product_id, department_id, date.to_rfc3339()],
+                |row| row.get(0),
+            )
+            .map_err(AppError::DatabaseError)?;
 
         match sum_str {
             Some(s) => {
@@ -147,17 +158,31 @@ impl<'a> Repository<'a> {
         }
     }
 
-    pub fn sum_range(
+    pub fn sum_range_for_product_department(
         &self,
         product_id: &str,
+        department_id: &str,
         start: DateTime<Utc>,
         end: DateTime<Utc>,
     ) -> AppResult<Decimal> {
-        let sum_str: Option<String> = self.db.connection().query_row(
-            "SELECT CAST(SUM(dispensed_amount) AS TEXT) FROM inventory_ledger WHERE product_id = ?1 AND transaction_date BETWEEN ?2 AND ?3",
-            params![product_id, start.to_rfc3339(), end.to_rfc3339()],
-            |row| row.get(0),
-        ).map_err(AppError::DatabaseError)?;
+        let sum_str: Option<String> = self
+            .db
+            .connection()
+            .query_row(
+                "SELECT CAST(SUM(dispensed_amount) AS TEXT)
+             FROM inventory_ledger
+             WHERE product_id = ?1
+               AND department_id = ?2
+               AND transaction_date BETWEEN ?3 AND ?4",
+                params![
+                    product_id,
+                    department_id,
+                    start.to_rfc3339(),
+                    end.to_rfc3339()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(AppError::DatabaseError)?;
 
         match sum_str {
             Some(s) => {
@@ -220,13 +245,15 @@ impl<'a> Repository<'a> {
         &self,
         tx: &Transaction<'a>,
         product_id: &str,
+        department_id: &str,
         dispensed_amount: Decimal,
     ) -> AppResult<()> {
         tx.execute(
-            "INSERT INTO product_totals (product_id, total_sum) 
-             VALUES (?1, ?2) 
-             ON CONFLICT(product_id) DO UPDATE SET total_sum = total_sum + excluded.total_sum",
-            params![product_id, dispensed_amount.to_string()],
+            "INSERT INTO product_totals (product_id, department_id, total_sum)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(product_id, department_id)
+             DO UPDATE SET total_sum = total_sum + excluded.total_sum",
+            params![product_id, department_id, dispensed_amount.to_string()],
         )
         .map_err(AppError::DatabaseError)?;
         Ok(())
@@ -271,25 +298,35 @@ impl<'a> Repository<'a> {
         self.insert_file_history(tx, file_history)?;
         self.batch_insert_ledger(tx, entries)?;
 
-        let mut per_product_totals: BTreeMap<&str, Decimal> = BTreeMap::new();
+        let mut per_product_department_totals: BTreeMap<(&str, &str), Decimal> = BTreeMap::new();
         for entry in entries {
-            per_product_totals
-                .entry(entry.product_id.as_str())
+            if entry.dispensed_amount == Decimal::ZERO {
+                continue;
+            }
+
+            per_product_department_totals
+                .entry((entry.product_id.as_str(), entry.department_id.as_str()))
                 .and_modify(|sum| *sum += entry.dispensed_amount)
                 .or_insert(entry.dispensed_amount);
         }
 
-        for (product_id, total_sum) in per_product_totals {
-            self.upsert_product_total(tx, product_id, total_sum)?;
+        for ((product_id, department_id), total_sum) in per_product_department_totals {
+            self.upsert_product_total(tx, product_id, department_id, total_sum)?;
         }
 
         Ok(())
     }
 
-    pub fn get_total(&self, product_id: &str) -> AppResult<Decimal> {
+    pub fn get_total_for_product_department(
+        &self,
+        product_id: &str,
+        department_id: &str,
+    ) -> AppResult<Decimal> {
         let res = self.db.connection().query_row(
-            "SELECT CAST(total_sum AS TEXT) FROM product_totals WHERE product_id = ?1",
-            params![product_id],
+            "SELECT CAST(total_sum AS TEXT)
+             FROM product_totals
+             WHERE product_id = ?1 AND department_id = ?2",
+            params![product_id, department_id],
             |row| row.get::<_, String>(0),
         );
 
@@ -300,6 +337,76 @@ impl<'a> Repository<'a> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(Decimal::ZERO),
             Err(e) => Err(AppError::DatabaseError(e)),
         }
+    }
+
+    pub fn get_totals_grouped_by_product_department(
+        &self,
+    ) -> AppResult<Vec<(String, String, Decimal)>> {
+        let mut stmt = self
+            .db
+            .connection()
+            .prepare(
+                "SELECT product_id, department_id, CAST(total_sum AS TEXT)
+                 FROM product_totals
+                 ORDER BY product_id ASC, department_id ASC",
+            )
+            .map_err(AppError::DatabaseError)?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let product_id: String = row.get(0)?;
+                let department_id: String = row.get(1)?;
+                let total_sum_str: String = row.get(2)?;
+                let total_sum = total_sum_str
+                    .parse::<Decimal>()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+
+                Ok((product_id, department_id, total_sum))
+            })
+            .map_err(AppError::DatabaseError)?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(AppError::DatabaseError)?);
+        }
+
+        Ok(out)
+    }
+
+    pub fn get_nonzero_product_department_sums_before_date(
+        &self,
+        date: DateTime<Utc>,
+    ) -> AppResult<Vec<(String, String, Decimal)>> {
+        let mut stmt = self
+            .db
+            .connection()
+            .prepare(
+                "SELECT product_id, department_id, CAST(SUM(dispensed_amount) AS TEXT)
+                 FROM inventory_ledger
+                 WHERE transaction_date < ?1
+                 GROUP BY product_id, department_id
+                 HAVING SUM(dispensed_amount) != 0
+                 ORDER BY product_id ASC, department_id ASC",
+            )
+            .map_err(AppError::DatabaseError)?;
+
+        let rows = stmt
+            .query_map(params![date.to_rfc3339()], |row| {
+                let product_id: String = row.get(0)?;
+                let department_id: String = row.get(1)?;
+                let sum_str: String = row.get(2)?;
+                let sum = sum_str
+                    .parse::<Decimal>()
+                    .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                Ok((product_id, department_id, sum))
+            })
+            .map_err(AppError::DatabaseError)?;
+
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(AppError::DatabaseError)?);
+        }
+        Ok(out)
     }
 }
 
@@ -377,9 +484,14 @@ mod tests {
             2
         );
         assert_eq!(
-            repo.get_total("P001")
+            repo.get_total_for_product_department("P001", "ER")
                 .expect("product total query should succeed"),
-            Decimal::new(5, 0)
+            Decimal::new(3, 0)
+        );
+        assert_eq!(
+            repo.get_total_for_product_department("P001", "ICU")
+                .expect("product total query should succeed"),
+            Decimal::new(2, 0)
         );
     }
 
@@ -423,7 +535,7 @@ mod tests {
             "ledger rows must rollback"
         );
         assert_eq!(
-            repo.get_total("P001")
+            repo.get_total_for_product_department("P001", "ER")
                 .expect("product total query should succeed"),
             Decimal::ZERO,
             "product_totals upsert must rollback"

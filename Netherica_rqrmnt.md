@@ -183,19 +183,21 @@ CREATE TABLE inventory_ledger (
 
 ```sql
 CREATE TABLE product_totals (
-    product_id TEXT PRIMARY KEY,
-    total_sum TEXT NOT NULL               -- running sum of dispensed_amount
+    product_id TEXT NOT NULL,
+    department_id TEXT NOT NULL,          -- raw code, e.g., "ER_CODE"
+    total_sum TEXT NOT NULL,               -- running sum of dispensed_amount
+    PRIMARY KEY (product_id, department_id)
 );
 ```
 
 **Update rule (incremental):**
 ```sql
-INSERT INTO product_totals(product_id, total_sum)
-VALUES (?, ?)
-ON CONFLICT(product_id) DO UPDATE SET total_sum = total_sum + excluded.total_sum;
+INSERT INTO product_totals(product_id, department_id, total_sum)
+VALUES (?, ?, ?)
+ON CONFLICT(product_id, department_id) DO UPDATE SET total_sum = total_sum + excluded.total_sum;
 ```
 
-**Note:** `product_totals` reflects the **cumulative sum of all transactions regardless of order**. For per‑file opening leftover calculations (e.g., dry run), the system must use a date‑filtered query on `inventory_ledger`, not `product_totals`.
+**Note:** `product_totals` reflects the **cumulative sum of all transactions per (`product_id`, `department_id`) regardless of order**. For per‑file opening leftover calculations (e.g., dry run), the system must use a date‑filtered query on `inventory_ledger`, not `product_totals`.
 
 ### 4.3 Schema Migrations
 
@@ -204,6 +206,10 @@ ON CONFLICT(product_id) DO UPDATE SET total_sum = total_sum + excluded.total_sum
 - Each migration is a separate SQL file compiled into binary via `rust-embed`.
 - Migration list:
   - `v0 → v1`: Initial schema creation (tables, indexes).
+  - `v1 → v2`: Upgrade `product_totals` key from legacy single key to composite key (`product_id`, `department_id`).
+    - Backfill source: recompute from `inventory_ledger` via `GROUP BY product_id, department_id` and `SUM(dispensed_amount)`.
+    - Index update: remove obsolete unique index/constraint on legacy `product_totals(product_id)`; enforce composite uniqueness with `PRIMARY KEY (product_id, department_id)` (or equivalent unique composite index).
+    - Transactional execution: run `CREATE TABLE product_totals_v2 ...`; backfill `INSERT ... SELECT ... GROUP BY ...`; validate row counts/sums; swap tables (`DROP` old, `ALTER TABLE ... RENAME TO product_totals`); recreate dependent indexes; set `PRAGMA user_version = 2`; commit atomically.
 - Migration runs inside transaction; on failure, abort startup with clear error.
 
 #### Indexes
@@ -251,10 +257,10 @@ VALUES (?, ?, ?, ?);
 INSERT INTO inventory_ledger (file_hash, product_id, department_id, dispensed_amount, transaction_date)
 VALUES (?, ?, ?, ?, ?);   -- one per Excel row
 
--- Update product_totals incrementally (one INSERT OR UPDATE per product)
-INSERT INTO product_totals (product_id, total_sum)
-VALUES (?, ?)
-ON CONFLICT(product_id) DO UPDATE SET total_sum = total_sum + excluded.total_sum;
+-- Update product_totals incrementally (one INSERT OR UPDATE per product per department)
+INSERT INTO product_totals (product_id, department_id, total_sum)
+VALUES (?, ?, ?)
+ON CONFLICT(product_id, department_id) DO UPDATE SET total_sum = total_sum + excluded.total_sum;
 
 COMMIT;
 
@@ -313,10 +319,10 @@ All domain functions return `AppResult<T>`. No panics in production code.
 
 ### 6.2 Inventory Model (Event Sourced)
 
-For a given product and cutoff date:
+For a given (`product_id`, `department_id`) and cutoff date:
 
 ```rust
-let total_sum = db.sum_ledger_for_product_before_date(product_id, cutoff_date);
+let total_sum = db.sum_ledger_for_product_department_before_date(product_id, department_id, cutoff_date);
 let factor = Decimal::from_str(&config.factor).unwrap();
 let leftover = euclidean_mod(total_sum, factor);
 let whole_units = (total_sum / factor).floor();
@@ -327,12 +333,13 @@ let whole_units = (total_sum / factor).floor();
 - **Euclidean modulo** for leftovers:
   `euclidean_mod(a, n) = ((a % n) + n) % n` where `n > 0`.
 - **Decimal arithmetic** via `rust_decimal` (no floating point).
+- **`factor == 1` rule:** leftover tracking is disabled; opening leftover and closing leftover are always treated as `0`.
 - **Whole units consumed this period** =
-  `(new_total_sum / factor).floor() - (prior_total_sum / factor).floor()`
+  `(new_total_sum / factor).floor() - (prior_total_sum / factor).floor()` where both totals are scoped to the same (`product_id`, `department_id`).
 
 ### 6.4 Aggregation Strategy
 
-- **`product_totals`** – O(1) access to current cumulative sum (used for “current leftover” display, e.g., after processing).
+- **`product_totals`** – O(1) access to current cumulative sum per (`product_id`, `department_id`) (used for “current leftover” display, e.g., after processing).
 - **Date‑filtered ledger** – Used for dry run (opening leftover as of file’s transaction date) and for historical reports.
 - **Fallback** – If `product_totals` is missing (e.g., first run), recompute from ledger.
 
@@ -481,19 +488,19 @@ The Ingestion section uses a linear workflow state machine:
   - **Computation Time:** Elapsed time for dry run calculation
 - **Reconciliation Ledger Table** (`egui_extras::TableBuilder`):
 
-| Product | Department Breakdown | Opening Leftover (subunits) | Total Subunits Used | Whole Units Output | Closing Leftover (subunits) |
-|---------|----------------------|-----------------------------|---------------------|--------------------|----------------------------|
+| Product | Department | Opening Leftover (subunits) | Total Subunits Used | Whole Units Output | Closing Leftover (subunits) |
+|---------|------------|-----------------------------|---------------------|--------------------|----------------------------|
 
   - **Table styling:**
     - Header: `surface-container-low` background, `label-sm` uppercase text
     - Rows: No grid lines, `1.5rem` row height, hover to `surface-container-high`
     - Ghost borders at 15% opacity for column separation if needed
-  - **Department Breakdown:** Concatenated string, e.g., `ER: 150, OPD: -20`
-  - **Opening Leftover:** Computed from ledger before this file's transaction date
-  - **Total Subunits Used:** Sum of `dispensed_amount` from this file (per product)
+  - **Department:** The department code/name for this row.
+  - **Opening Leftover:** Computed from ledger for the same (`product_id`, `department_id`) before this file's transaction date; if `factor == 1`, this value is always `0`
+  - **Total Subunits Used:** Explicitly per one `Product + Department` pair (not product-wide)
   - **Whole Units Output:** As defined in Section 6.2
-  - **Closing Leftover:** Opening + total subunits used, modulo factor
-  - **Row count indicator:** "Showing {visible} of {total} reconciled products"
+  - **Closing Leftover:** Opening + total subunits used, modulo factor; if `factor == 1`, this value is always `0`
+  - **Row count indicator:** "Showing {visible} of {total} adjustment rows (Product + Department)"
 - **Status Indicators:** 4px dots -- `error` for failures, `tertiary` for warnings
 - **Confirmation Footer:**
   - Warning text: "Confirming will finalize the period-end reconciliation and update the central inventory ledger."
@@ -606,12 +613,13 @@ The Settings section contains two sub-views accessible via tabs or sub-navigatio
 **All report dates display Buddhist Era (BE) years for user familiarity.**
 
 - **Header:** Processed filename, local timestamp (BE), transaction date range (BE).
-- **For each product:**
-  - Opening leftover (subunits)
+- **For each `Product + Department` row (deterministic sort: product then department):**
+  - Opening leftover per department row (subunits, scoped by `product_id + department_id`; if `factor == 1`, always `0`)
   - Consumption per department (table rows)
   - Total subunits consumed
   - Whole units output
-  - Closing leftover (subunits)
+  - Closing leftover per department row (subunits, scoped by `product_id + department_id`; if `factor == 1`, always `0`)
+- **Carry-over rule:** include any `Product + Department` row whose opening leftover is non-zero, even when the current file contains no transaction for that pair.
 - **Footer:** Generation timestamp (BE), report version v3.1, file hash.
 
 ### 8.3 Year Conversion for Reports
@@ -631,7 +639,7 @@ fn format_be_date(dt: &DateTime<Utc>) -> String {
 
 ### 8.4 Workflow After Commit
 
-1. Generate HTML using ledger data from the committed file (plus prior totals for opening balances).
+1. Generate HTML using ledger data from the committed file (plus prior totals per `product_id + department_id` for opening balances).
 2. Write HTML to `./reports/YYYYMMDD_HHMMSS_report.html` (create directory if missing).
 3. Open in system default browser using `open` / `start` / `xdg-open`.
 4. Show dialog: *“Report ready. Press Ctrl+P to print or save as PDF.”*
@@ -788,7 +796,6 @@ track_subunits = true
 | HTML generation fails after commit | Log error, allow "Regenerate" later. |
 | Archive move fails | Log warning, set retry flag. |
 | Duplicate `product.id` in config | Abort on startup, "Duplicate product ID: X". |
-| Duplicate `product.sheet_name` in config | Abort on startup, "Duplicate sheet name: X". |
 | Empty `departments` in config | Abort on startup, "At least one department required." |
 | Empty Excel sheet (no data rows) | Skip sheet, toast warning, continue. |
 | File modification time used as transaction_date | Log warning, toast "Using file date. Verify before confirming." |
@@ -801,6 +808,8 @@ track_subunits = true
 
 ### 14.1 Unit Tests
 - Euclidean modulo with positive/negative dividends.
+- Department-scoped modulo behaviour (`product_id + department_id` isolation).
+- `factor == 1` path: opening/closing leftovers forced to `0`, output still computed.
 - Whole units consumed calculation.
 - Decimal parsing and rounding.
 - Date parsing: `DD-MM-YYYY HH:MM` format validation.
@@ -809,7 +818,11 @@ track_subunits = true
 
 ### 14.2 Integration Tests
 - Process one file → verify ledger entries and `product_totals`.
-- Process second file (later date) → verify opening leftover is correct.
+- Process second file (later date) → verify opening leftover is correct per `product_id + department_id`.
+- Migration `v1 -> v2` backfill: verify `product_totals(product_id, department_id)` is rebuilt from ledger.
+- Same product across multiple departments and files → composite totals increment correctly.
+- Review dry-run shows only `Product + Department` pairs present in the new file.
+- Report includes non-zero carry-over rows even if current file has no transaction for that department.
 - Attempt out‑of‑order file → must reject.
 - Duplicate file hash → reject.
 - Product ID mismatch in row → row skipped, warning logged.
@@ -918,7 +931,7 @@ The main table should follow the sample's shape and labels as closely as practic
 Row behavior:
 - `Consume Department Code`: mapped department code + display name (eg `[245] CATH LAB`).
 - `Product name`: Product display name (eg `GLOVE DISPOSSABLE SIZE S/PAIR(คู่)`)
-- `ยอดยกมา`: opening value for the section context.
+- `ยอดยกมา`: opening value for the same `product_id + department_id` context.
 - `ขอยืม`: requested/borrowed amount, the tools do not process borrow so its intentional leave empty.
 - `เบิก`: dispensed amount used for ledger/report totals, in whole amount
 - `จ่าย`: usually it dispense(`เบิก`)-borrowed (`ขอยืม`) since we do not process borrow it is to be leave empty.

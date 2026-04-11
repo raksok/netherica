@@ -1,5 +1,5 @@
 use crate::config::{ColumnNames, Config};
-use crate::domain::{DepartmentUsage, DryRunRow};
+use crate::domain::DryRunRow;
 use crate::error::{AppError, AppResult};
 use crate::models::{FileHistory, LedgerEntry, LedgerRow};
 use crate::report::{self, ReportRenderInput};
@@ -143,6 +143,7 @@ pub fn prepare_ingestion_dry_run(
 
 pub fn commit_prepared_ingestion(
     pending: &PendingIngestionCommit,
+    config: &Config,
     repository: &Repository<'_>,
     reports_dir: &Path,
     archive_dir: &Path,
@@ -156,13 +157,20 @@ pub fn commit_prepared_ingestion(
 
     repository.commit_ingestion_batch(&file_history, &pending.ledger_entries)?;
 
+    let report_rows = report::build_report_rows_for_entries(
+        repository,
+        config,
+        &pending.ledger_entries,
+        pending.period_start,
+    )?;
+
     let report_input = ReportRenderInput {
         source_filename: pending.filename.clone(),
         file_hash: pending.file_hash.clone(),
         generated_at_utc: Utc::now(),
         period_start_utc: pending.period_start,
         period_end_utc: pending.period_end,
-        rows: pending.dry_run_rows.clone(),
+        rows: report_rows,
         product_metadata: pending.product_metadata.clone(),
         department_metadata: pending.department_metadata.clone(),
     };
@@ -204,7 +212,7 @@ pub fn ingest_excel_file(
     reports_dir: &Path,
 ) -> AppResult<IngestionOutcome> {
     let pending = prepare_ingestion_dry_run(file_path, config, repository)?;
-    commit_prepared_ingestion(&pending, repository, reports_dir, archive_dir)
+    commit_prepared_ingestion(&pending, config, repository, reports_dir, archive_dir)
 }
 
 fn build_report_product_metadata(
@@ -345,9 +353,7 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
                 continue;
             }
 
-            let cell = row
-                .get(column_indexes.date_visit)
-                .unwrap_or(&Data::Empty);
+            let cell = row.get(column_indexes.date_visit).unwrap_or(&Data::Empty);
             let transaction_date_result = extract_transaction_date(cell, file_mtime_utc);
             let transaction_date = transaction_date_result.date();
 
@@ -476,7 +482,10 @@ impl DateExtractionResult {
     }
 
     pub fn is_fallback(&self) -> bool {
-        matches!(self, Self::FallbackMissing(_) | Self::FallbackUnparseable(_))
+        matches!(
+            self,
+            Self::FallbackMissing(_) | Self::FallbackUnparseable(_)
+        )
     }
 }
 
@@ -513,7 +522,8 @@ pub fn extract_transaction_date(cell: &Data, file_mtime: DateTime<Utc>) -> DateE
             }
         }
         Data::Float(serial) => {
-            let dt = calamine::ExcelDateTime::new(*serial, calamine::ExcelDateTimeType::DateTime, false);
+            let dt =
+                calamine::ExcelDateTime::new(*serial, calamine::ExcelDateTimeType::DateTime, false);
             if let Some(naive) = dt.as_datetime() {
                 return DateExtractionResult::Extracted(apply_be_heuristic(naive));
             }
@@ -537,7 +547,7 @@ pub fn extract_transaction_date(cell: &Data, file_mtime: DateTime<Utc>) -> DateE
         }
         _ => {}
     }
-    
+
     if let Some(naive) = cell.as_datetime() {
         return DateExtractionResult::Extracted(apply_be_heuristic(naive));
     }
@@ -566,13 +576,13 @@ fn build_dry_run_rows(
     config: &Config,
     rows: &[LedgerRow],
 ) -> AppResult<Vec<DryRunRow>> {
-    let factor_by_product = config
+    let product_meta_by_id = config
         .products
         .iter()
-        .map(|p| (p.id.as_str(), p.factor))
+        .map(|p| (p.id.as_str(), (p.factor, p.display_name.as_str())))
         .collect::<BTreeMap<_, _>>();
 
-    let mut usage_by_product = BTreeMap::<String, BTreeMap<String, Decimal>>::new();
+    let mut usage_by_product_department = BTreeMap::<(String, String), Decimal>::new();
     let period_start = rows
         .iter()
         .map(|r| r.transaction_date)
@@ -580,43 +590,53 @@ fn build_dry_run_rows(
         .ok_or_else(|| AppError::DomainError("No rows available for dry-run data".to_string()))?;
 
     for row in rows {
-        usage_by_product
-            .entry(row.product_id.clone())
-            .or_default()
-            .entry(row.department_id.clone())
+        if row.dispensed_amount == Decimal::ZERO {
+            continue;
+        }
+
+        usage_by_product_department
+            .entry((row.product_id.clone(), row.department_id.clone()))
             .and_modify(|sum| *sum += row.dispensed_amount)
             .or_insert(row.dispensed_amount);
     }
 
     let mut result = Vec::new();
-    for (product_id, dept_usage) in usage_by_product {
-        let factor = factor_by_product
+    for ((product_id, department_id), total_subunits_used) in usage_by_product_department {
+        let (factor, product_display_name) = product_meta_by_id
             .get(product_id.as_str())
             .copied()
             .ok_or_else(|| {
-                AppError::DomainError(format!("Missing product factor for '{}'", product_id))
-            })?;
+            AppError::DomainError(format!("Missing product factor for '{}'", product_id))
+        })?;
 
-        let opening_total = repository.sum_before_date(&product_id, period_start)?;
-        let opening_leftover = euclidean_mod(opening_total, factor)?;
+        let opening_total = repository.sum_before_date_for_product_department(
+            &product_id,
+            &department_id,
+            period_start,
+        )?;
 
-        let mut total_subunits_used = Decimal::ZERO;
-        let mut department_breakdown = Vec::new();
-        for (department, qty) in dept_usage {
-            total_subunits_used += qty;
-            department_breakdown.push(DepartmentUsage {
-                department,
-                quantity: qty,
-            });
-        }
+        let (opening_leftover, whole_units_output, closing_leftover) = if factor == Decimal::ONE {
+            (Decimal::ZERO, total_subunits_used, Decimal::ZERO)
+        } else {
+            let opening_leftover = euclidean_mod(opening_total, factor)?;
+            let new_total = opening_total + total_subunits_used;
+            let whole_units_output =
+                (new_total / factor).floor() - (opening_total / factor).floor();
+            let closing_leftover = euclidean_mod(new_total, factor)?;
+            (opening_leftover, whole_units_output, closing_leftover)
+        };
 
-        let running_total = opening_leftover + total_subunits_used;
-        let whole_units_output = (running_total / factor).floor();
-        let closing_leftover = euclidean_mod(running_total, factor)?;
+        let department_display_name = config
+            .departments
+            .get(&department_id)
+            .cloned()
+            .unwrap_or_else(|| department_id.clone());
 
         result.push(DryRunRow {
             product_id,
-            department_breakdown,
+            product_display_name: product_display_name.to_string(),
+            department_id,
+            department_display_name,
             opening_leftover,
             total_subunits_used,
             whole_units_output,
@@ -946,6 +966,112 @@ mod tests {
     }
 
     #[test]
+    fn build_dry_run_rows_is_scoped_by_product_and_department() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(5, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([
+                ("ER".to_string(), "Emergency".to_string()),
+                ("ICU".to_string(), "Intensive Care".to_string()),
+            ]),
+        };
+
+        repo.commit_ingestion_batch(
+            &FileHistory {
+                file_hash: "seed".to_string(),
+                filename: "seed.xlsx".to_string(),
+                file_size: 1,
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+            },
+            &[LedgerEntry {
+                product_id: "P001".to_string(),
+                department_id: "ER".to_string(),
+                dispensed_amount: Decimal::new(7, 0),
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
+                file_hash: "seed".to_string(),
+            }],
+        )
+        .expect("seed ingestion should succeed");
+
+        let rows = vec![LedgerRow {
+            product_id: "P001".to_string(),
+            department_id: "ICU".to_string(),
+            dispensed_amount: Decimal::new(3, 0),
+            transaction_date: Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
+        }];
+
+        let dry_rows =
+            build_dry_run_rows(&repo, &config, &rows).expect("dry run rows should build");
+        assert_eq!(dry_rows.len(), 1);
+        let row = &dry_rows[0];
+        assert_eq!(row.department_id, "ICU");
+        assert_eq!(
+            row.opening_leftover,
+            Decimal::ZERO,
+            "ER carry-over must not leak into ICU"
+        );
+        assert_eq!(row.whole_units_output, Decimal::ZERO);
+        assert_eq!(row.closing_leftover, Decimal::new(3, 0));
+    }
+
+    #[test]
+    fn build_dry_run_rows_factor_one_forces_zero_leftovers() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::ONE,
+                track_subunits: false,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let rows = vec![LedgerRow {
+            product_id: "P001".to_string(),
+            department_id: "ER".to_string(),
+            dispensed_amount: Decimal::new(4, 0),
+            transaction_date: Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
+        }];
+
+        let dry_rows =
+            build_dry_run_rows(&repo, &config, &rows).expect("dry run rows should build");
+        assert_eq!(dry_rows.len(), 1);
+        let row = &dry_rows[0];
+        assert_eq!(row.opening_leftover, Decimal::ZERO);
+        assert_eq!(row.closing_leftover, Decimal::ZERO);
+        assert_eq!(row.total_subunits_used, Decimal::new(4, 0));
+        assert_eq!(row.whole_units_output, Decimal::new(4, 0));
+    }
+
+    #[test]
     fn end_to_end_ingestion_validates_success_and_rejections() {
         let temp = tempdir().expect("tempdir should be created");
         let input_dir = temp.path().join("input");
@@ -1028,8 +1154,14 @@ mod tests {
             2
         );
         assert_eq!(
-            repo.get_total("P001").expect("total query should work"),
-            Decimal::new(5, 0)
+            repo.get_total_for_product_department("P001", "ER")
+                .expect("total query should work"),
+            Decimal::new(3, 0)
+        );
+        assert_eq!(
+            repo.get_total_for_product_department("P001", "ICU")
+                .expect("total query should work"),
+            Decimal::new(2, 0)
         );
         assert_eq!(
             fs::read_dir(&reports_dir)
@@ -1066,8 +1198,14 @@ mod tests {
             .expect("archive should succeed")
             .exists());
         assert_eq!(
-            repo.get_total("P001").expect("total query should work"),
-            Decimal::new(9, 0)
+            repo.get_total_for_product_department("P001", "ER")
+                .expect("total query should work"),
+            Decimal::new(7, 0)
+        );
+        assert_eq!(
+            repo.get_total_for_product_department("P001", "ICU")
+                .expect("total query should work"),
+            Decimal::new(2, 0)
         );
         assert_eq!(
             fs::read_dir(&reports_dir)
@@ -1304,7 +1442,8 @@ mod tests {
             "dry-run phase must not write inventory_ledger"
         );
         assert_eq!(
-            repo.get_total("P001").expect("total query should succeed"),
+            repo.get_total_for_product_department("P001", "ER")
+                .expect("total query should succeed"),
             Decimal::ZERO,
             "dry-run phase must not write product_totals"
         );
@@ -1352,8 +1491,9 @@ mod tests {
 
         let pending = prepare_ingestion_dry_run(&file, &config, &repo)
             .expect("dry-run preparation should succeed");
-        let outcome = commit_prepared_ingestion(&pending, &repo, &reports_dir, &archive_dir)
-            .expect("confirm phase should commit successfully");
+        let outcome =
+            commit_prepared_ingestion(&pending, &config, &repo, &reports_dir, &archive_dir)
+                .expect("confirm phase should commit successfully");
 
         assert!(outcome.report_path.exists());
         assert!(outcome
@@ -1372,8 +1512,159 @@ mod tests {
             1
         );
         assert_eq!(
-            repo.get_total("P001").expect("total query should succeed"),
+            repo.get_total_for_product_department("P001", "ER")
+                .expect("total query should succeed"),
             Decimal::new(5, 0)
+        );
+    }
+
+    #[test]
+    fn review_dry_run_shows_only_product_department_pairs_present_in_new_file() {
+        let temp = tempdir().expect("tempdir should be created");
+        let input_dir = temp.path().join("input");
+        fs::create_dir_all(&input_dir).expect("input dir should be created");
+
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(2, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([
+                ("ER".to_string(), "Emergency".to_string()),
+                ("ICU".to_string(), "Intensive Care".to_string()),
+            ]),
+        };
+
+        repo.commit_ingestion_batch(
+            &FileHistory {
+                file_hash: "seed-review".to_string(),
+                filename: "seed.xlsx".to_string(),
+                file_size: 1,
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+            },
+            &[LedgerEntry {
+                product_id: "P001".to_string(),
+                department_id: "ICU".to_string(),
+                dispensed_amount: Decimal::new(3, 0),
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 10, 0, 0).single().unwrap(),
+                file_hash: "seed-review".to_string(),
+            }],
+        )
+        .expect("seed ingestion should succeed");
+
+        let file = input_dir.join("review_only_new_pairs.xlsx");
+        write_excel(
+            &file,
+            &[RowInput {
+                date_visit_be: "02-04-2569 08:00",
+                department: "ER",
+                code: "P001",
+                qty: 2,
+            }],
+        );
+
+        let pending = prepare_ingestion_dry_run(&file, &config, &repo)
+            .expect("dry run preparation should succeed");
+        assert_eq!(pending.dry_run_rows.len(), 1);
+        assert_eq!(pending.dry_run_rows[0].department_id, "ER");
+    }
+
+    #[test]
+    fn commit_aggregates_totals_once_per_product_department_across_multiple_files() {
+        let temp = tempdir().expect("tempdir should be created");
+        let input_dir = temp.path().join("input");
+        let archive_dir = temp.path().join("archive");
+        let reports_dir = temp.path().join("reports");
+        fs::create_dir_all(&input_dir).expect("input dir should be created");
+
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(2, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([
+                ("ER".to_string(), "Emergency".to_string()),
+                ("ICU".to_string(), "Intensive Care".to_string()),
+            ]),
+        };
+
+        let first_file = input_dir.join("multi_dept_first.xlsx");
+        write_excel(
+            &first_file,
+            &[
+                RowInput {
+                    date_visit_be: "01-04-2569 08:00",
+                    department: "ER",
+                    code: "P001",
+                    qty: 3,
+                },
+                RowInput {
+                    date_visit_be: "01-04-2569 09:00",
+                    department: "ICU",
+                    code: "P001",
+                    qty: 2,
+                },
+            ],
+        );
+        ingest_excel_file(&first_file, &config, &repo, &archive_dir, &reports_dir)
+            .expect("first ingest should succeed");
+
+        let second_file = input_dir.join("multi_dept_second.xlsx");
+        write_excel(
+            &second_file,
+            &[
+                RowInput {
+                    date_visit_be: "02-04-2569 08:00",
+                    department: "ER",
+                    code: "P001",
+                    qty: 4,
+                },
+                RowInput {
+                    date_visit_be: "02-04-2569 09:00",
+                    department: "ICU",
+                    code: "P001",
+                    qty: 1,
+                },
+            ],
+        );
+        ingest_excel_file(&second_file, &config, &repo, &archive_dir, &reports_dir)
+            .expect("second ingest should succeed");
+
+        assert_eq!(
+            repo.get_total_for_product_department("P001", "ER")
+                .expect("total query should succeed"),
+            Decimal::new(7, 0)
+        );
+        assert_eq!(
+            repo.get_total_for_product_department("P001", "ICU")
+                .expect("total query should succeed"),
+            Decimal::new(3, 0)
         );
     }
 
@@ -1481,8 +1772,9 @@ mod tests {
 
         fs::remove_file(&file).expect("source file should be deleted to simulate move failure");
 
-        let outcome = commit_prepared_ingestion(&pending, &repo, &reports_dir, &archive_dir)
-            .expect("commit should succeed even when archive move fails");
+        let outcome =
+            commit_prepared_ingestion(&pending, &config, &repo, &reports_dir, &archive_dir)
+                .expect("commit should succeed even when archive move fails");
 
         assert!(outcome.report_path.exists());
         assert!(outcome.archived_path.is_none());
@@ -2185,7 +2477,8 @@ mod tests {
         sheet.write_string(0, 0, "01-04-2569 08:00").unwrap();
 
         // 2. Native Excel datetime written using rust_xlsxwriter's ExcelDateTime
-        let dt_native = rust_xlsxwriter::ExcelDateTime::parse_from_str("2026-04-01T08:00:00").unwrap();
+        let dt_native =
+            rust_xlsxwriter::ExcelDateTime::parse_from_str("2026-04-01T08:00:00").unwrap();
         sheet.write_datetime(1, 0, &dt_native).unwrap();
 
         // 3. Excel serial number as float (approximation of 2026-04-01 08:00)
@@ -2202,14 +2495,19 @@ mod tests {
         // 6. Invalid string
         sheet.write_string(5, 0, "not-a-date").unwrap();
 
-        workbook.save(&workbook_path).expect("workbook should be saved");
+        workbook
+            .save(&workbook_path)
+            .expect("workbook should be saved");
 
         // Parse with calamine
         let mut reader = calamine::open_workbook_auto(&workbook_path).expect("open fails");
         let sheet_names = reader.sheet_names().to_vec();
-        let range = reader.worksheet_range(&sheet_names[0]).expect("range fails");
+        let range = reader
+            .worksheet_range(&sheet_names[0])
+            .expect("range fails");
 
-        let expected_naive = NaiveDateTime::parse_from_str("2026-04-01T08:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+        let expected_naive =
+            NaiveDateTime::parse_from_str("2026-04-01T08:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let expected_utc = DateTime::<Utc>::from_naive_utc_and_offset(expected_naive, Utc);
 
         // Verify 1: BE text string
@@ -2228,7 +2526,7 @@ mod tests {
         let cell2 = range.get((2, 0)).unwrap_or(&Data::Empty);
         let res2 = extract_transaction_date(cell2, file_mtime);
         assert!(!res2.is_fallback());
-        assert_eq!(res2.date().timestamp(), expected_utc.timestamp()); 
+        assert_eq!(res2.date().timestamp(), expected_utc.timestamp());
 
         // Verify 4: ISO string
         let cell3 = range.get((3, 0)).unwrap_or(&Data::Empty);
@@ -2258,13 +2556,14 @@ mod tests {
         // Simulate a cell with an ISO date string that has a Buddhist Era year (>2400)
         let iso_str_be = "2569-04-01T08:00:00";
         let cell = Data::DateTimeIso(iso_str_be.to_string());
-        
+
         // When extracted, the heuristic should intercept it and subtract 543 from the year
         let res = extract_transaction_date(&cell, file_mtime);
-        
-        let expected_naive = NaiveDateTime::parse_from_str("2026-04-01T08:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
+
+        let expected_naive =
+            NaiveDateTime::parse_from_str("2026-04-01T08:00:00", "%Y-%m-%dT%H:%M:%S").unwrap();
         let expected_utc = DateTime::<Utc>::from_naive_utc_and_offset(expected_naive, Utc);
-        
+
         assert!(!res.is_fallback());
         assert_eq!(res.date(), expected_utc);
     }

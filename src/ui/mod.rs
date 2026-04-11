@@ -48,7 +48,7 @@ fn apply_design_system(ctx: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(12.0, 12.0);
     style.spacing.window_margin = egui::Margin::same(24.0);
     style.spacing.button_padding = egui::vec2(16.0, 8.0);
-    
+
     // 2. Color Tokens (Nordic Precision - The Arctic Atelier)
     let primary = egui::Color32::from_rgb(163, 220, 236); // #a3dcec
     let surface_container_lowest = egui::Color32::from_rgb(8, 14, 25); // #080e19
@@ -56,13 +56,13 @@ fn apply_design_system(ctx: &egui::Context) {
     let surface_container_low = egui::Color32::from_rgb(22, 28, 39); // #161c27
     let surface_container = egui::Color32::from_rgb(26, 32, 43); // #1a202b
     let surface_container_high = egui::Color32::from_rgb(36, 42, 54); // #242a36
-    
+
     let on_surface = egui::Color32::from_rgb(221, 226, 242); // #dde2f2
     let on_surface_variant = egui::Color32::from_rgb(192, 200, 203); // #c0c8cb
     let on_primary = egui::Color32::from_rgb(0, 54, 64); // #003640
-    
+
     let outline_variant_40 = egui::Color32::from_rgba_premultiplied(64, 72, 75, 102); // 40% focus ghost border
-    
+
     // Backgrounds
     visuals.window_fill = surface_container_low; // Panels/windows sit on surface base
     visuals.panel_fill = surface; // Base background
@@ -79,17 +79,17 @@ fn apply_design_system(ctx: &egui::Context) {
     // Widget colors & interactions
     visuals.widgets.noninteractive.bg_fill = surface_container_low;
     visuals.widgets.noninteractive.fg_stroke.color = on_surface_variant;
-    
+
     visuals.widgets.inactive.bg_fill = surface_container; // Default cards/buttons
     visuals.widgets.inactive.fg_stroke.color = on_surface;
-    
+
     visuals.widgets.hovered.bg_fill = surface_container_high;
     visuals.widgets.hovered.fg_stroke.color = on_surface;
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, outline_variant_40); // Hover Ghost Border
-    
+
     visuals.widgets.active.bg_fill = primary;
     visuals.widgets.active.fg_stroke.color = on_primary;
-    
+
     visuals.selection.bg_fill = primary;
     visuals.selection.stroke.color = on_primary;
 
@@ -312,6 +312,7 @@ impl NethericaApp {
                 let repository = Repository::new(&db);
                 ingestion::commit_prepared_ingestion(
                     &pending,
+                    &config,
                     &repository,
                     &data_dir.reports,
                     &data_dir.archive,
@@ -332,7 +333,7 @@ impl NethericaApp {
     fn render_dry_run_view(&mut self, ui: &mut egui::Ui) {
         ui.vertical(|ui| {
             ui.heading("Dry Run Preview");
-            ui.label("Review the following breakdown before committing to the database.");
+            ui.label("Review Product + Department adjustment rows before committing.");
             ui.add_space(10.0);
 
             if let Some(pending) = &self.pending_commit {
@@ -357,8 +358,8 @@ impl NethericaApp {
                 .max_height(table_height)
                 .show(ui, |ui| {
                 TableBuilder::new(ui)
-                    .column(Column::auto()) // Product
-                    .column(Column::remainder()) // Department Breakdown
+                    .column(Column::remainder()) // Product
+                    .column(Column::remainder()) // Department
                     .column(Column::auto()) // Opening Leftover
                     .column(Column::auto()) // Total Subunits Used
                     .column(Column::auto()) // Whole Units Output
@@ -368,13 +369,13 @@ impl NethericaApp {
                             ui.strong("Product");
                         });
                         header.col(|ui| {
-                            ui.strong("Department Breakdown");
+                            ui.strong("Department");
                         });
                         header.col(|ui| {
                             ui.strong("Opening Leftover");
                         });
                         header.col(|ui| {
-                            ui.strong("Total Subunits Used");
+                            ui.strong("Total Subunits Used (Product + Department)");
                         });
                         header.col(|ui| {
                             ui.strong("Whole Units Output");
@@ -388,16 +389,16 @@ impl NethericaApp {
                             let index = row.index();
                             let row_data = &self.dry_run_data[index];
                             row.col(|ui| {
-                                ui.label(&row_data.product_id);
+                                ui.label(format!(
+                                    "{} ({})",
+                                    row_data.product_display_name, row_data.product_id
+                                ));
                             });
                             row.col(|ui| {
-                                let breakdown_text = row_data
-                                    .department_breakdown
-                                    .iter()
-                                    .map(|d| format!("{}: {}", d.department, d.quantity))
-                                    .collect::<Vec<_>>()
-                                    .join(", ");
-                                ui.label(breakdown_text);
+                                ui.label(format!(
+                                    "{} ({})",
+                                    row_data.department_display_name, row_data.department_id
+                                ));
                             });
                             row.col(|ui| {
                                 ui.label(row_data.opening_leftover.to_string());
@@ -416,6 +417,10 @@ impl NethericaApp {
                 });
 
             ui.add_space(8.0);
+            ui.label(format!(
+                "{} adjustment row(s) (Product + Department).",
+                self.dry_run_data.len()
+            ));
             ui.separator();
             ui.add_space(8.0);
             ui.horizontal(|ui| {

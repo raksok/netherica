@@ -2,15 +2,11 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DepartmentUsage {
-    pub department: String,
-    pub quantity: Decimal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DryRunRow {
     pub product_id: String,
-    pub department_breakdown: Vec<DepartmentUsage>,
+    pub product_display_name: String,
+    pub department_id: String,
+    pub department_display_name: String,
     pub opening_leftover: Decimal,
     pub total_subunits_used: Decimal,
     pub whole_units_output: Decimal,

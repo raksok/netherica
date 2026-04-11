@@ -80,7 +80,11 @@ pub fn render_report_html(input: &ReportRenderInput) -> AppResult<String> {
     let thai_font_base64 = load_font_base64(THAI_FONT_PATH)?;
 
     let mut ordered_rows = input.rows.clone();
-    ordered_rows.sort_by(|a, b| a.product_id.cmp(&b.product_id));
+    ordered_rows.sort_by(|a, b| {
+        a.product_id
+            .cmp(&b.product_id)
+            .then_with(|| a.department_id.cmp(&b.department_id))
+    });
 
     let rows = ordered_rows
         .iter()
@@ -89,49 +93,31 @@ pub fn render_report_html(input: &ReportRenderInput) -> AppResult<String> {
             let product_display_name = product_meta
                 .map(|meta| meta.display_name.clone())
                 .filter(|name| !name.trim().is_empty())
+                .or_else(|| {
+                    (!row.product_display_name.trim().is_empty())
+                        .then_some(row.product_display_name.clone())
+                })
                 .unwrap_or_else(|| "-".to_string());
             let unit = product_meta
                 .map(|meta| meta.unit.clone())
                 .filter(|name| !name.trim().is_empty())
                 .unwrap_or_else(|| "-".to_string());
 
-            let mut department_breakdown = row.department_breakdown.clone();
-            department_breakdown.sort_by(|a, b| a.department.cmp(&b.department));
+            let consume_department_code = input
+                .department_metadata
+                .get(&row.department_id)
+                .cloned()
+                .unwrap_or_else(|| row.department_display_name.clone());
 
-            let mut department_rows = Vec::with_capacity(department_breakdown.len().max(1));
-            for (idx, usage) in department_breakdown.iter().enumerate() {
-                let consume_department_code = input
-                    .department_metadata
-                    .get(&usage.department)
-                    .cloned()
-                    .unwrap_or_else(|| usage.department.clone());
-
-                department_rows.push(ReportTemplateDepartmentRow {
-                    consume_department_code,
-                    product_name: product_display_name.clone(),
-                    opening_leftover: if idx == 0 {
-                        decimal_to_string(row.opening_leftover)
-                    } else {
-                        String::new()
-                    },
-                    borrowed: String::new(),
-                    dispensed: decimal_to_string(usage.quantity),
-                    issued: String::new(),
-                    unit: unit.clone(),
-                });
-            }
-
-            if department_rows.is_empty() {
-                department_rows.push(ReportTemplateDepartmentRow {
-                    consume_department_code: "-".to_string(),
-                    product_name: product_display_name.clone(),
-                    opening_leftover: decimal_to_string(row.opening_leftover),
-                    borrowed: String::new(),
-                    dispensed: "0".to_string(),
-                    issued: String::new(),
-                    unit: unit.clone(),
-                });
-            }
+            let department_rows = vec![ReportTemplateDepartmentRow {
+                consume_department_code,
+                product_name: product_display_name.clone(),
+                opening_leftover: decimal_to_string(row.opening_leftover),
+                borrowed: String::new(),
+                dispensed: decimal_to_string(row.total_subunits_used),
+                issued: String::new(),
+                unit: unit.clone(),
+            }];
 
             ReportTemplateRow {
                 product_id: row.product_id.clone(),
@@ -245,7 +231,7 @@ pub fn regenerate_last_report(
             )
         })?;
 
-    let rows = build_rows_from_entries(repository, config, &entries, period_start)?;
+    let rows = build_report_rows_for_entries(repository, config, &entries, period_start)?;
     let generated_at_utc = Utc::now();
     let input = ReportRenderInput {
         source_filename: file_history.filename,
@@ -298,12 +284,10 @@ fn aggregate_department_totals(rows: &[DryRunRow]) -> BTreeMap<String, Decimal> 
     let mut totals = BTreeMap::<String, Decimal>::new();
 
     for row in rows {
-        for usage in &row.department_breakdown {
-            totals
-                .entry(usage.department.clone())
-                .and_modify(|sum| *sum += usage.quantity)
-                .or_insert(usage.quantity);
-        }
+        totals
+            .entry(row.department_id.clone())
+            .and_modify(|sum| *sum += row.total_subunits_used)
+            .or_insert(row.total_subunits_used);
     }
 
     totals
@@ -349,60 +333,86 @@ fn euclidean_mod(a: Decimal, n: Decimal) -> AppResult<Decimal> {
     }
 }
 
-fn build_rows_from_entries(
+pub fn build_report_rows_for_entries(
     repository: &Repository<'_>,
     config: &Config,
     entries: &[crate::models::LedgerEntry],
     period_start: DateTime<Utc>,
 ) -> AppResult<Vec<DryRunRow>> {
-    let factor_by_product = config
+    let product_meta_by_id = config
         .products
         .iter()
-        .map(|p| (p.id.as_str(), p.factor))
+        .map(|p| (p.id.as_str(), (p.factor, p.display_name.as_str())))
         .collect::<BTreeMap<_, _>>();
 
-    let mut usage_by_product = BTreeMap::<String, BTreeMap<String, Decimal>>::new();
+    let mut usage_by_product_department = BTreeMap::<(String, String), Decimal>::new();
     for entry in entries {
-        usage_by_product
-            .entry(entry.product_id.clone())
-            .or_default()
-            .entry(entry.department_id.clone())
+        if entry.dispensed_amount == Decimal::ZERO {
+            continue;
+        }
+
+        usage_by_product_department
+            .entry((entry.product_id.clone(), entry.department_id.clone()))
             .and_modify(|sum| *sum += entry.dispensed_amount)
             .or_insert(entry.dispensed_amount);
     }
 
+    let carry_over = repository.get_nonzero_product_department_sums_before_date(period_start)?;
+    for (product_id, department_id, opening_total) in carry_over {
+        let Some((factor, _)) = product_meta_by_id.get(product_id.as_str()).copied() else {
+            continue;
+        };
+        if factor == Decimal::ONE {
+            continue;
+        }
+        let opening_leftover = euclidean_mod(opening_total, factor)?;
+        if opening_leftover != Decimal::ZERO {
+            usage_by_product_department
+                .entry((product_id, department_id))
+                .or_insert(Decimal::ZERO);
+        }
+    }
+
     let mut rows = Vec::new();
-    for (product_id, dept_usage) in usage_by_product {
-        let factor = factor_by_product
+    for ((product_id, department_id), total_subunits_used) in usage_by_product_department {
+        let (factor, product_display_name) = product_meta_by_id
             .get(product_id.as_str())
             .copied()
             .ok_or_else(|| {
-                AppError::DomainError(format!(
-                    "Missing factor config for product '{}', cannot regenerate report",
-                    product_id
-                ))
-            })?;
+            AppError::DomainError(format!(
+                "Missing factor config for product '{}', cannot regenerate report",
+                product_id
+            ))
+        })?;
 
-        let opening_total = repository.sum_before_date(&product_id, period_start)?;
-        let opening_leftover = euclidean_mod(opening_total, factor)?;
+        let opening_total = repository.sum_before_date_for_product_department(
+            &product_id,
+            &department_id,
+            period_start,
+        )?;
 
-        let mut total_subunits_used = Decimal::ZERO;
-        let mut department_breakdown = Vec::new();
-        for (department, qty) in dept_usage {
-            total_subunits_used += qty;
-            department_breakdown.push(crate::domain::DepartmentUsage {
-                department,
-                quantity: qty,
-            });
-        }
+        let (opening_leftover, whole_units_output, closing_leftover) = if factor == Decimal::ONE {
+            (Decimal::ZERO, total_subunits_used, Decimal::ZERO)
+        } else {
+            let opening_leftover = euclidean_mod(opening_total, factor)?;
+            let new_total = opening_total + total_subunits_used;
+            let whole_units_output =
+                (new_total / factor).floor() - (opening_total / factor).floor();
+            let closing_leftover = euclidean_mod(new_total, factor)?;
+            (opening_leftover, whole_units_output, closing_leftover)
+        };
 
-        let running_total = opening_leftover + total_subunits_used;
-        let whole_units_output = (running_total / factor).floor();
-        let closing_leftover = euclidean_mod(running_total, factor)?;
+        let department_display_name = config
+            .departments
+            .get(&department_id)
+            .cloned()
+            .unwrap_or_else(|| department_id.clone());
 
         rows.push(DryRunRow {
             product_id,
-            department_breakdown,
+            product_display_name: product_display_name.to_string(),
+            department_id,
+            department_display_name,
             opening_leftover,
             total_subunits_used,
             whole_units_output,
@@ -418,7 +428,6 @@ mod tests {
     use super::*;
     use crate::config::{ColumnNames, Config, ProductConfig, Settings};
     use crate::db::Database;
-    use crate::domain::DepartmentUsage;
     use crate::models::{FileHistory, LedgerEntry};
     use crate::repository::Repository;
     use chrono::TimeZone;
@@ -443,18 +452,11 @@ mod tests {
             period_end_utc: Utc.with_ymd_and_hms(2026, 4, 7, 23, 59, 0).unwrap(),
             rows: vec![DryRunRow {
                 product_id: "P001".to_string(),
-                department_breakdown: vec![
-                    DepartmentUsage {
-                        department: "ICU".to_string(),
-                        quantity: Decimal::new(125, 1),
-                    },
-                    DepartmentUsage {
-                        department: "ER".to_string(),
-                        quantity: Decimal::new(25, 1),
-                    },
-                ],
+                product_display_name: "Product 001".to_string(),
+                department_id: "ICU".to_string(),
+                department_display_name: "Intensive Care".to_string(),
                 opening_leftover: Decimal::new(12, 1),
-                total_subunits_used: Decimal::new(150, 1),
+                total_subunits_used: Decimal::new(125, 1),
                 whole_units_output: Decimal::new(15, 0),
                 closing_leftover: Decimal::new(0, 1),
             }],
@@ -479,7 +481,6 @@ mod tests {
         assert!(html.contains("P001"));
         assert!(html.contains("Product 001"));
         assert!(html.contains("[202] ICU"));
-        assert!(html.contains("[101] ER"));
         assert!(html.contains("font-family: 'Sarabun'"));
         assert!(html.contains("Consume Department Code"));
         assert!(html.contains("Product name"));
@@ -491,17 +492,6 @@ mod tests {
         assert!(html.contains("Report version:</strong> v0.1"));
         assert!(html.contains("Generated at (BE, local):"));
         assert!(html.contains("A4 landscape"));
-
-        let er_index = html
-            .find("[101] ER")
-            .expect("ER row should be rendered in department table");
-        let icu_index = html
-            .find("[202] ICU")
-            .expect("ICU row should be rendered in department table");
-        assert!(
-            er_index < icu_index,
-            "department rows should be deterministically sorted"
-        );
 
         let header_count = html.matches("Processed filename:").count();
         assert_eq!(
@@ -521,10 +511,9 @@ mod tests {
             rows: vec![
                 DryRunRow {
                     product_id: "P002".to_string(),
-                    department_breakdown: vec![DepartmentUsage {
-                        department: "ICU".to_string(),
-                        quantity: Decimal::new(4, 0),
-                    }],
+                    product_display_name: "Product 002".to_string(),
+                    department_id: "ICU".to_string(),
+                    department_display_name: "Intensive Care".to_string(),
                     opening_leftover: Decimal::new(0, 0),
                     total_subunits_used: Decimal::new(4, 0),
                     whole_units_output: Decimal::new(4, 0),
@@ -532,10 +521,9 @@ mod tests {
                 },
                 DryRunRow {
                     product_id: "P001".to_string(),
-                    department_breakdown: vec![DepartmentUsage {
-                        department: "ER".to_string(),
-                        quantity: Decimal::new(2, 0),
-                    }],
+                    product_display_name: "Product 001".to_string(),
+                    department_id: "ER".to_string(),
+                    department_display_name: "Emergency".to_string(),
                     opening_leftover: Decimal::new(1, 0),
                     total_subunits_used: Decimal::new(2, 0),
                     whole_units_output: Decimal::new(3, 0),
@@ -732,5 +720,80 @@ mod tests {
         assert!(html.contains("Product 001"));
         assert!(html.contains("Intensive Care"));
         assert!(html.contains("Emergency"));
+        assert!(html.contains("Ward"));
+
+        let er_idx = html.find("Emergency").expect("ER row should appear");
+        let icu_idx = html.find("Intensive Care").expect("ICU row should appear");
+        let ward_idx = html
+            .find("Ward")
+            .expect("Ward carry-over row should appear");
+        assert!(er_idx < icu_idx && icu_idx < ward_idx);
+    }
+
+    #[test]
+    fn report_builder_includes_nonzero_carry_over_rows_without_current_file_transactions() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        repo.commit_ingestion_batch(
+            &FileHistory {
+                file_hash: "prior".to_string(),
+                filename: "prior.xlsx".to_string(),
+                file_size: 10,
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+            },
+            &[LedgerEntry {
+                product_id: "P001".to_string(),
+                department_id: "WARD".to_string(),
+                dispensed_amount: Decimal::new(3, 0),
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
+                file_hash: "prior".to_string(),
+            }],
+        )
+        .expect("seed should commit");
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(2, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([
+                ("ER".to_string(), "Emergency".to_string()),
+                ("WARD".to_string(), "Ward".to_string()),
+            ]),
+        };
+
+        let current_entries = vec![LedgerEntry {
+            product_id: "P001".to_string(),
+            department_id: "ER".to_string(),
+            dispensed_amount: Decimal::new(2, 0),
+            transaction_date: Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
+            file_hash: "current".to_string(),
+        }];
+
+        let rows = build_report_rows_for_entries(
+            &repo,
+            &config,
+            &current_entries,
+            Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
+        )
+        .expect("report rows should build");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].department_id, "ER");
+        assert_eq!(rows[1].department_id, "WARD");
+        assert_eq!(rows[1].opening_leftover, Decimal::new(1, 0));
+        assert_eq!(rows[1].total_subunits_used, Decimal::ZERO);
     }
 }
