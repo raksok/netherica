@@ -94,6 +94,12 @@
       text-align: left;
     }
 
+    .header-subunit {
+      display: block;
+      font-size: 9px;
+      line-height: 1.1;
+    }
+
     .num {
       text-align: right;
       white-space: nowrap;
@@ -183,13 +189,14 @@
       <table>
         <thead>
           <tr>
-            <th style="width: 24%;">Consume Department Code</th>
-            <th style="width: 26%;">Product name</th>
-            <th class="num" style="width: 10%;">ยอดยกมา</th>
-            <th class="num" style="width: 10%;">ขอยืม</th>
-            <th class="num" style="width: 10%;">เบิก</th>
-            <th class="num" style="width: 10%;">จ่าย</th>
-            <th style="width: 10%;">unit</th>
+            <th style="width: 22%;">Consume Department Code</th>
+            <th style="width: 22%;">Product name</th>
+            <th class="num" style="width: 9%;">ยอดยกมา</th>
+            <th class="num" style="width: 9%;">ขอยืม</th>
+            <th class="num" style="width: 12%;">เบิก<br><span class="header-subunit">({{ row.subunit }})</span></th>
+            <th class="num" style="width: 8%;">จ่าย</th>
+            <th class="num" style="width: 9%;">ยอดยกไป</th>
+            <th style="width: 9%;">unit</th>
           </tr>
         </thead>
         <tbody>
@@ -201,6 +208,7 @@
             <td class="num">{{ dept.borrowed }}</td>
             <td class="num">{{ dept.dispensed }}</td>
             <td class="num">{{ dept.issued }}</td>
+            <td class="num">{{ dept.closing_leftover }}</td>
             <td>{{ dept.unit }}</td>
           </tr>
           {% endfor %}

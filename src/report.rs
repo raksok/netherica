@@ -36,6 +36,7 @@ pub struct ReportRenderInput {
 #[derive(Debug, Clone)]
 pub struct ReportProductMetadata {
     pub display_name: String,
+    pub subunit: String,
     pub unit: String,
 }
 
@@ -43,6 +44,7 @@ pub struct ReportProductMetadata {
 struct ReportTemplateRow {
     product_id: String,
     product_display_name: String,
+    subunit: String,
     unit: String,
     opening_leftover: String,
     total_subunits_used: String,
@@ -70,6 +72,7 @@ struct ReportTemplateDepartmentRow {
     borrowed: String,
     dispensed: String,
     issued: String,
+    closing_leftover: String,
     #[serde(skip)]
     issued_val: Decimal,
     unit: String,
@@ -114,6 +117,10 @@ pub fn render_report_html(input: &ReportRenderInput) -> AppResult<String> {
             .map(|meta| meta.unit.clone())
             .filter(|name| !name.trim().is_empty())
             .unwrap_or_else(|| "-".to_string());
+        let subunit = product_meta
+            .map(|meta| meta.subunit.clone())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| "-".to_string());
 
         let consume_department_code = input
             .department_metadata
@@ -128,6 +135,7 @@ pub fn render_report_html(input: &ReportRenderInput) -> AppResult<String> {
             borrowed: String::new(),
             dispensed: decimal_to_string(row.total_subunits_used),
             issued: decimal_to_string(row.issued),
+            closing_leftover: decimal_to_string(row.closing_leftover),
             issued_val: row.issued,
             unit: unit.clone(),
         };
@@ -143,6 +151,7 @@ pub fn render_report_html(input: &ReportRenderInput) -> AppResult<String> {
             rows.push(ReportTemplateRow {
                 product_id: row.product_id.clone(),
                 product_display_name: product_display_name.clone(),
+                subunit,
                 unit,
                 opening_leftover: decimal_to_string(row.opening_leftover),
                 total_subunits_used: decimal_to_string(row.total_subunits_used),
@@ -286,6 +295,7 @@ pub fn regenerate_last_report(
                     p.id.clone(),
                     ReportProductMetadata {
                         display_name: p.display_name.clone(),
+                        subunit: p.subunit.clone(),
                         unit: p.unit.clone(),
                     },
                 )
@@ -449,7 +459,8 @@ pub fn build_report_rows_for_entries(
 
         let carry_over_borrowed = repository.get_borrowed_carryover(&product_id, &department_id)?;
         let ingested_borrowed = Decimal::ZERO;
-        let net_subunits = total_subunits_used - carry_over_borrowed - ingested_borrowed;
+        let net_subunits =
+            total_subunits_used + opening_leftover - carry_over_borrowed - ingested_borrowed;
         let issued = (net_subunits / factor).floor();
 
         let department_display_name = config
@@ -518,6 +529,7 @@ mod tests {
                 "P001".to_string(),
                 ReportProductMetadata {
                     display_name: "Product 001".to_string(),
+                    subunit: "Piece".to_string(),
                     unit: "PAIR".to_string(),
                 },
             )]),
@@ -542,10 +554,21 @@ mod tests {
         assert!(html.contains("ขอยืม"));
         assert!(html.contains("เบิก"));
         assert!(html.contains("จ่าย"));
+        assert!(html.contains("ยอดยกไป"));
+        assert!(html.contains(r#"header-subunit">(Piece)</span>"#));
         assert!(html.contains("unit"));
         assert!(html.contains("Report version:</strong> v0.2.2"));
         assert!(html.contains("Generated at (BE, local):"));
         assert!(html.contains("A4 landscape"));
+
+        let closing_header_idx = html
+            .find("ยอดยกไป")
+            .expect("closing leftover header should appear");
+        let unit_header_idx = html.find("unit</th>").expect("unit header should appear");
+        assert!(
+            closing_header_idx < unit_header_idx,
+            "closing leftover column must be rendered before unit"
+        );
 
         let header_count = html.matches("Processed filename:").count();
         assert_eq!(
@@ -593,6 +616,7 @@ mod tests {
                     "P001".to_string(),
                     ReportProductMetadata {
                         display_name: "Product 001".to_string(),
+                        subunit: "Piece".to_string(),
                         unit: "PAIR".to_string(),
                     },
                 ),
@@ -600,6 +624,7 @@ mod tests {
                     "P002".to_string(),
                     ReportProductMetadata {
                         display_name: "Product 002".to_string(),
+                        subunit: "Ml".to_string(),
                         unit: "ROLL".to_string(),
                     },
                 ),
@@ -616,6 +641,8 @@ mod tests {
         assert!(html.contains("Product 001"));
         assert!(html.contains("Product 002"));
         assert_eq!(html.matches("Consume Department Code").count(), 2);
+        assert!(html.contains(r#"header-subunit">(Piece)</span>"#));
+        assert!(html.contains(r#"header-subunit">(Ml)</span>"#));
 
         let p001_index = html
             .find("<p class=\"product-id\">P001</p>")
@@ -635,6 +662,90 @@ mod tests {
         assert!(
             html.contains("<span>จ่าย (รวม)</span><strong>0</strong>"),
             "issued summary should show computed total"
+        );
+    }
+
+    #[test]
+    fn renders_department_closing_leftover_before_unit_column() {
+        let input = ReportRenderInput {
+            source_filename: "sample.xlsx".to_string(),
+            file_hash: "hash3".to_string(),
+            generated_at_utc: Utc.with_ymd_and_hms(2026, 4, 8, 12, 30, 0).unwrap(),
+            period_start_utc: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).unwrap(),
+            period_end_utc: Utc.with_ymd_and_hms(2026, 4, 7, 23, 59, 0).unwrap(),
+            rows: vec![
+                DryRunRow {
+                    product_id: "P001".to_string(),
+                    product_display_name: "Product 001".to_string(),
+                    department_id: "ER".to_string(),
+                    department_display_name: "Emergency".to_string(),
+                    opening_leftover: Decimal::new(11, 0),
+                    borrowed: Decimal::ZERO,
+                    total_subunits_used: Decimal::new(22, 0),
+                    issued: Decimal::new(33, 0),
+                    whole_units_output: Decimal::new(44, 0),
+                    closing_leftover: Decimal::new(104, 0),
+                },
+                DryRunRow {
+                    product_id: "P001".to_string(),
+                    product_display_name: "Product 001".to_string(),
+                    department_id: "ICU".to_string(),
+                    department_display_name: "Intensive Care".to_string(),
+                    opening_leftover: Decimal::new(55, 0),
+                    borrowed: Decimal::ZERO,
+                    total_subunits_used: Decimal::new(66, 0),
+                    issued: Decimal::new(77, 0),
+                    whole_units_output: Decimal::new(88, 0),
+                    closing_leftover: Decimal::new(208, 0),
+                },
+            ],
+            product_metadata: BTreeMap::from([(
+                "P001".to_string(),
+                ReportProductMetadata {
+                    display_name: "Product 001".to_string(),
+                    subunit: "Piece".to_string(),
+                    unit: "PAIR".to_string(),
+                },
+            )]),
+            department_metadata: BTreeMap::from([
+                ("ER".to_string(), "ER_ROW".to_string()),
+                ("ICU".to_string(), "ICU_ROW".to_string()),
+            ]),
+        };
+
+        let html = render_report_html(&input).expect("report rendering should succeed");
+        assert!(html.contains("ยอดยกไป"));
+        assert!(html.contains("<td class=\"num\">104</td>"));
+        assert!(html.contains("<td class=\"num\">208</td>"));
+
+        let er_row_idx = html.find("<td>ER_ROW</td>").expect("ER row should appear");
+        let er_closing_idx = html[er_row_idx..]
+            .find("<td class=\"num\">104</td>")
+            .map(|idx| er_row_idx + idx)
+            .expect("ER closing leftover should appear");
+        let er_unit_idx = html[er_row_idx..]
+            .find("<td>PAIR</td>")
+            .map(|idx| er_row_idx + idx)
+            .expect("ER unit should appear");
+        assert!(
+            er_closing_idx < er_unit_idx,
+            "ER closing leftover cell must be before unit cell"
+        );
+
+        let icu_row_idx = html
+            .find("<td>ICU_ROW</td>")
+            .expect("ICU row should appear");
+        let icu_closing_idx = html[icu_row_idx..]
+            .find("<td class=\"num\">208</td>")
+            .map(|idx| icu_row_idx + idx)
+            .expect("ICU closing leftover should appear");
+        let icu_unit_idx = html[icu_row_idx..]
+            .find("<td>PAIR</td>")
+            .map(|idx| icu_row_idx + idx)
+            .expect("ICU unit should appear");
+        assert!(
+            icu_closing_idx < icu_unit_idx,
+            "ICU closing leftover cell must be before unit cell"
         );
     }
 
@@ -872,11 +983,29 @@ mod tests {
     }
 
     #[test]
-    fn report_builder_calculates_issued_with_floor_and_carry_over() {
+    fn report_builder_calculates_issued_with_floor_carry_over_and_opening_leftover() {
         let temp = tempdir().expect("tempdir should be created");
         let db_path = temp.path().join("state.db");
         let db = Database::new(&db_path).expect("db should initialize");
         let repo = Repository::new(&db);
+
+        repo.commit_ingestion_batch(
+            &FileHistory {
+                file_hash: "prior_hash".to_string(),
+                filename: "prior.xlsx".to_string(),
+                file_size: 10,
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+            },
+            &[LedgerEntry {
+                product_id: "P001".to_string(),
+                department_id: "ER".to_string(),
+                dispensed_amount: Decimal::new(1, 0),
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
+                file_hash: "prior_hash".to_string(),
+                borrowed_amount: Decimal::ZERO,
+            }],
+        )
+        .expect("seed should commit");
 
         repo.upsert_borrowed_carryover_batch(&[(
             "P001".to_string(),
@@ -905,7 +1034,7 @@ mod tests {
         let entries = vec![LedgerEntry {
             product_id: "P001".to_string(),
             department_id: "ER".to_string(),
-            dispensed_amount: Decimal::new(5, 0),
+            dispensed_amount: Decimal::new(4, 0),
             transaction_date: Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
             file_hash: "test_hash".to_string(),
             borrowed_amount: Decimal::ZERO,
@@ -920,7 +1049,72 @@ mod tests {
         .expect("report rows should build");
 
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].opening_leftover, Decimal::new(1, 0));
         assert_eq!(rows[0].borrowed, Decimal::new(1, 0));
         assert_eq!(rows[0].issued, Decimal::new(2, 0));
+    }
+
+    #[test]
+    fn report_builder_factor_one_forces_zero_leftovers() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        repo.commit_ingestion_batch(
+            &FileHistory {
+                file_hash: "prior_hash_factor_one".to_string(),
+                filename: "prior_factor_one.xlsx".to_string(),
+                file_size: 10,
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+            },
+            &[LedgerEntry {
+                product_id: "P001".to_string(),
+                department_id: "ER".to_string(),
+                dispensed_amount: Decimal::new(3, 0),
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
+                file_hash: "prior_hash_factor_one".to_string(),
+                borrowed_amount: Decimal::ZERO,
+            }],
+        )
+        .expect("seed should commit");
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::ONE,
+                track_subunits: false,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let entries = vec![LedgerEntry {
+            product_id: "P001".to_string(),
+            department_id: "ER".to_string(),
+            dispensed_amount: Decimal::new(7, 0),
+            transaction_date: Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
+            file_hash: "current_hash_factor_one".to_string(),
+            borrowed_amount: Decimal::ZERO,
+        }];
+
+        let rows = build_report_rows_for_entries(
+            &repo,
+            &config,
+            &entries,
+            Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
+        )
+        .expect("report rows should build");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].opening_leftover, Decimal::ZERO);
+        assert_eq!(rows[0].closing_leftover, Decimal::ZERO);
     }
 }

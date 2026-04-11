@@ -230,6 +230,7 @@ fn build_report_product_metadata(
                 product.id.clone(),
                 report::ReportProductMetadata {
                     display_name: product.display_name.clone(),
+                    subunit: product.subunit.clone(),
                     unit: product.unit.clone(),
                 },
             )
@@ -639,7 +640,8 @@ fn build_dry_run_rows(
 
         let carry_over_borrowed = repository.get_borrowed_carryover(&product_id, &department_id)?;
         let ingested_borrowed = Decimal::ZERO;
-        let net_subunits = total_subunits_used - carry_over_borrowed - ingested_borrowed;
+        let net_subunits =
+            total_subunits_used + opening_leftover - carry_over_borrowed - ingested_borrowed;
         let issued = (net_subunits / factor).floor();
 
         let department_display_name = config
@@ -669,7 +671,8 @@ fn build_borrowed_carryover_updates(rows: &[DryRunRow]) -> Vec<(String, String, 
     rows.iter()
         .map(|row| {
             let ingested_borrowed = Decimal::ZERO;
-            let net_subunits = row.total_subunits_used - row.borrowed - ingested_borrowed;
+            let net_subunits =
+                row.total_subunits_used + row.opening_leftover - row.borrowed - ingested_borrowed;
             let new_carryover = if net_subunits < Decimal::ZERO {
                 -net_subunits
             } else {
@@ -1111,6 +1114,70 @@ mod tests {
     }
 
     #[test]
+    fn build_dry_run_rows_issued_includes_opening_leftover() {
+        let temp = tempdir().expect("tempdir should be created");
+        let db_path = temp.path().join("state.db");
+        let db = Database::new(&db_path).expect("db should initialize");
+        let repo = Repository::new(&db);
+
+        repo.commit_ingestion_batch(
+            &FileHistory {
+                file_hash: "prior_hash".to_string(),
+                filename: "prior.xlsx".to_string(),
+                file_size: 10,
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 0, 0, 0).single().unwrap(),
+            },
+            &[LedgerEntry {
+                product_id: "P001".to_string(),
+                department_id: "ER".to_string(),
+                dispensed_amount: Decimal::new(1, 0),
+                transaction_date: Utc.with_ymd_and_hms(2026, 4, 1, 8, 0, 0).single().unwrap(),
+                file_hash: "prior_hash".to_string(),
+                borrowed_amount: Decimal::ZERO,
+            }],
+        )
+        .expect("seed should commit");
+
+        repo.upsert_borrowed_carryover_batch(&[(
+            "P001".to_string(),
+            "ER".to_string(),
+            Decimal::new(1, 0),
+        )])
+        .expect("carryover seed should succeed");
+
+        let config = Config {
+            database_path: db_path,
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(2, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let rows = vec![LedgerRow {
+            product_id: "P001".to_string(),
+            department_id: "ER".to_string(),
+            dispensed_amount: Decimal::new(4, 0),
+            transaction_date: Utc.with_ymd_and_hms(2026, 4, 2, 8, 0, 0).single().unwrap(),
+        }];
+
+        let dry_rows =
+            build_dry_run_rows(&repo, &config, &rows).expect("dry run rows should build");
+        assert_eq!(dry_rows.len(), 1);
+        assert_eq!(dry_rows[0].opening_leftover, Decimal::new(1, 0));
+        assert_eq!(dry_rows[0].borrowed, Decimal::new(1, 0));
+        assert_eq!(dry_rows[0].issued, Decimal::new(2, 0));
+    }
+
+    #[test]
     fn commit_persists_negative_issued_carryover() {
         let temp = tempdir().expect("tempdir should be created");
         let input_dir = temp.path().join("input");
@@ -1171,6 +1238,7 @@ mod tests {
                 "P001".to_string(),
                 report::ReportProductMetadata {
                     display_name: "Product 001".to_string(),
+                    subunit: "Piece".to_string(),
                     unit: "Box".to_string(),
                 },
             )]),
@@ -1261,6 +1329,7 @@ mod tests {
                 "P001".to_string(),
                 report::ReportProductMetadata {
                     display_name: "Product 001".to_string(),
+                    subunit: "Piece".to_string(),
                     unit: "Box".to_string(),
                 },
             )]),
@@ -1286,6 +1355,28 @@ mod tests {
             .get_borrowed_carryover("P001", "ER")
             .expect("carryover query should succeed");
         assert_eq!(updated, Decimal::ZERO);
+    }
+
+    #[test]
+    fn carryover_updates_include_opening_leftover() {
+        let rows = vec![DryRunRow {
+            product_id: "P001".to_string(),
+            product_display_name: "Product 001".to_string(),
+            department_id: "ER".to_string(),
+            department_display_name: "Emergency".to_string(),
+            opening_leftover: Decimal::new(1, 0),
+            borrowed: Decimal::new(1, 0),
+            total_subunits_used: Decimal::ZERO,
+            issued: Decimal::ZERO,
+            whole_units_output: Decimal::ZERO,
+            closing_leftover: Decimal::ZERO,
+        }];
+
+        let updates = build_borrowed_carryover_updates(&rows);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].0, "P001");
+        assert_eq!(updates[0].1, "ER");
+        assert_eq!(updates[0].2, Decimal::ZERO);
     }
 
     #[test]
