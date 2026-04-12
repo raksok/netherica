@@ -2,6 +2,7 @@
 name: architect
 description: "High-level system design and technical specification creator for Netherica."
 mode: subagent
+model: "zai-coding-plan/glm-5"
 permission:
   edit: allow
   bash:

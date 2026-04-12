@@ -256,6 +256,10 @@ struct ParsedWorkbook {
 
 fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
     let file_mtime_utc = file_modified_time_utc(path)?;
+    let filename_date_range = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .and_then(parse_filename_date_range);
     let mut workbook = open_workbook_auto(path)
         .map_err(|e| AppError::ExcelError(format!("Failed to open workbook: {e}")))?;
 
@@ -277,6 +281,7 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
     }
 
     let mut rows = Vec::<LedgerRow>::new();
+    let mut date_sources = Vec::<DateSource>::new();
     let mut earliest: Option<DateTime<Utc>> = None;
     let mut matching_sheets_found = 0usize;
     let mut sheet_with_required_columns_found = false;
@@ -362,9 +367,12 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
             let cell = row.get(column_indexes.date_visit).unwrap_or(&Data::Empty);
             let transaction_date_result = extract_transaction_date(cell, file_mtime_utc);
             let transaction_date = transaction_date_result.date();
+            let date_source = transaction_date_result
+                .source()
+                .unwrap_or(DateSource::StringSource);
 
             match transaction_date_result {
-                DateExtractionResult::Extracted(_) => {
+                DateExtractionResult::Extracted(_, _) => {
                     tracing::debug!(sheet = %product.id, row_number = row_idx + 2, "Native date extracted");
                 }
                 DateExtractionResult::FallbackMissing(_) => {
@@ -398,6 +406,7 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
                 dispensed_amount,
                 transaction_date,
             });
+            date_sources.push(date_source);
         }
     }
 
@@ -432,6 +441,17 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
         None
     };
 
+    if let Some(range) = filename_date_range {
+        let repaired = repair_excel_corrupted_dates(&mut rows, &date_sources, range);
+        if repaired > 0 {
+            earliest = rows.iter().map(|r| r.transaction_date).min();
+            tracing::info!(
+                repaired_count = repaired,
+                "Repaired Excel-corrupted DD/MM swapped dates using filename anchor"
+            );
+        }
+    }
+
     Ok(ParsedWorkbook {
         rows,
         earliest_transaction_utc: earliest
@@ -447,6 +467,61 @@ fn file_modified_time_utc(path: &Path) -> AppResult<DateTime<Utc>> {
         .modified()
         .map_err(AppError::IoError)?;
     Ok(DateTime::<Utc>::from(modified))
+}
+
+pub fn parse_filename_date_range(filename: &str) -> Option<(NaiveDate, NaiveDate)> {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(filename);
+
+    let open = stem.find('(')?;
+    let close = stem.rfind(')')?;
+    if close <= open {
+        return None;
+    }
+    let inner = &stem[open + 1..close];
+    let parts: Vec<&str> = inner.split(" - ").collect();
+    if parts.len() != 2 {
+        return None;
+    }
+
+    let start = parse_english_date(parts[0].trim())?;
+    let end = parse_english_date(parts[1].trim())?;
+    Some((start, end))
+}
+
+fn parse_english_date(input: &str) -> Option<NaiveDate> {
+    let input = input.trim();
+    let (day_str, rest) = split_first_space(input)?;
+    let day: u32 = day_str.parse().ok()?;
+    let (month_str, year_str) = split_first_space(rest)?;
+    let month = month_abbreviation_to_number(month_str)?;
+    let year: i32 = year_str.trim_end_matches('.').parse().ok()?;
+    NaiveDate::from_ymd_opt(year, month, day)
+}
+
+fn split_first_space(s: &str) -> Option<(&str, &str)> {
+    let idx = s.find(' ')?;
+    Some((&s[..idx], &s[idx + 1..]))
+}
+
+fn month_abbreviation_to_number(abbr: &str) -> Option<u32> {
+    Some(match abbr {
+        "Jan." => 1,
+        "Feb." => 2,
+        "Mar." => 3,
+        "Apr." => 4,
+        "May." => 5,
+        "Jun." => 6,
+        "Jul." => 7,
+        "Aug." => 8,
+        "Sep." => 9,
+        "Oct." => 10,
+        "Nov." => 11,
+        "Dec." => 12,
+        _ => return None,
+    })
 }
 
 pub fn be_to_gregorian(input: &str) -> AppResult<DateTime<Utc>> {
@@ -471,9 +546,56 @@ pub fn be_to_gregorian(input: &str) -> AppResult<DateTime<Utc>> {
     Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
 }
 
+fn repair_excel_corrupted_dates(
+    rows: &mut [LedgerRow],
+    sources: &[DateSource],
+    range: (NaiveDate, NaiveDate),
+) -> usize {
+    let (range_start, range_end) = range;
+    let mut repaired = 0usize;
+
+    for (row, source) in rows.iter_mut().zip(sources.iter()) {
+        if *source != DateSource::ExcelNative {
+            continue;
+        }
+
+        let naive_date = row.transaction_date.date_naive();
+        if naive_date >= range_start && naive_date <= range_end {
+            continue;
+        }
+
+        let day = naive_date.day();
+        let month = naive_date.month();
+        if day > 12 {
+            continue;
+        }
+
+        if let Some(swapped) = NaiveDate::from_ymd_opt(naive_date.year(), day, month) {
+            if swapped >= range_start && swapped <= range_end {
+                let time = row.transaction_date.time();
+                if let Some(new_naive) =
+                    swapped.and_hms_opt(time.hour(), time.minute(), time.second())
+                {
+                    row.transaction_date =
+                        DateTime::<Utc>::from_naive_utc_and_offset(new_naive, Utc);
+                    repaired += 1;
+                }
+            }
+        }
+    }
+
+    repaired
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateSource {
+    ExcelNative,
+    StringSource,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum DateExtractionResult {
-    Extracted(DateTime<Utc>),
+    Extracted(DateTime<Utc>, DateSource),
     FallbackMissing(DateTime<Utc>),
     FallbackUnparseable(DateTime<Utc>),
 }
@@ -481,7 +603,7 @@ pub enum DateExtractionResult {
 impl DateExtractionResult {
     pub fn date(&self) -> DateTime<Utc> {
         match self {
-            Self::Extracted(dt) => *dt,
+            Self::Extracted(dt, _) => *dt,
             Self::FallbackMissing(dt) => *dt,
             Self::FallbackUnparseable(dt) => *dt,
         }
@@ -492,6 +614,13 @@ impl DateExtractionResult {
             self,
             Self::FallbackMissing(_) | Self::FallbackUnparseable(_)
         )
+    }
+
+    pub fn source(&self) -> Option<DateSource> {
+        match self {
+            Self::Extracted(_, s) => Some(*s),
+            _ => None,
+        }
     }
 }
 
@@ -519,43 +648,64 @@ pub fn extract_transaction_date(cell: &Data, file_mtime: DateTime<Utc>) -> DateE
         Data::Empty => return DateExtractionResult::FallbackMissing(file_mtime),
         Data::DateTime(excel_dt) => {
             if let Some(naive) = excel_dt.as_datetime() {
-                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+                return DateExtractionResult::Extracted(
+                    apply_be_heuristic(naive),
+                    DateSource::ExcelNative,
+                );
             }
         }
         Data::DateTimeIso(iso_str) => {
             if let Ok(naive) = NaiveDateTime::parse_from_str(iso_str.trim(), "%Y-%m-%dT%H:%M:%S") {
-                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+                return DateExtractionResult::Extracted(
+                    apply_be_heuristic(naive),
+                    DateSource::ExcelNative,
+                );
             }
         }
         Data::Float(serial) => {
             let dt =
                 calamine::ExcelDateTime::new(*serial, calamine::ExcelDateTimeType::DateTime, false);
             if let Some(naive) = dt.as_datetime() {
-                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+                return DateExtractionResult::Extracted(
+                    apply_be_heuristic(naive),
+                    DateSource::ExcelNative,
+                );
             }
         }
         Data::String(s) => {
             if let Ok(dt) = be_to_gregorian(s) {
-                return DateExtractionResult::Extracted(dt);
+                return DateExtractionResult::Extracted(dt, DateSource::StringSource);
             }
             if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%dT%H:%M:%S") {
-                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+                return DateExtractionResult::Extracted(
+                    apply_be_heuristic(naive),
+                    DateSource::StringSource,
+                );
             }
             if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M:%S") {
-                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+                return DateExtractionResult::Extracted(
+                    apply_be_heuristic(naive),
+                    DateSource::StringSource,
+                );
             }
             if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%Y-%m-%d %H:%M") {
-                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+                return DateExtractionResult::Extracted(
+                    apply_be_heuristic(naive),
+                    DateSource::StringSource,
+                );
             }
             if let Ok(naive) = NaiveDateTime::parse_from_str(s.trim(), "%d/%m/%Y %H:%M") {
-                return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+                return DateExtractionResult::Extracted(
+                    apply_be_heuristic(naive),
+                    DateSource::StringSource,
+                );
             }
         }
         _ => {}
     }
 
     if let Some(naive) = cell.as_datetime() {
-        return DateExtractionResult::Extracted(apply_be_heuristic(naive));
+        return DateExtractionResult::Extracted(apply_be_heuristic(naive), DateSource::ExcelNative);
     }
 
     if let Data::String(_) = cell {
@@ -2497,6 +2647,269 @@ mod tests {
     }
 
     #[test]
+    fn parse_filename_date_range_extracts_single_month_range() {
+        let (start, end) =
+            parse_filename_date_range("รายงานการใช้เวชภัณฑ์ (01 Mar. 2026 - 31 Mar. 2026).xlsx")
+                .expect("should parse");
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 3, 31).unwrap());
+    }
+
+    #[test]
+    fn parse_filename_date_range_extracts_cross_month_range() {
+        let (start, end) =
+            parse_filename_date_range("รายงานการใช้เวชภัณฑ์ (30 Mar. 2026 - 05 Apr. 2026).xlsx")
+                .expect("should parse");
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 3, 30).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 4, 5).unwrap());
+    }
+
+    #[test]
+    fn parse_filename_date_range_handles_thai_prefix() {
+        let result =
+            parse_filename_date_range("รายงานการใช้เวชภัณฑ์ (01 Mar. 2026 - 05 Apr. 2026).xlsx");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn parse_filename_date_range_returns_none_for_no_parens() {
+        let result = parse_filename_date_range("report-no-dates.xlsx");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_filename_date_range_returns_none_for_malformed_date() {
+        let result = parse_filename_date_range("(30 Foo. 2026 - 05 Bar. 2026).xlsx");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn parse_filename_date_range_handles_full_path() {
+        let (start, end) = parse_filename_date_range(
+            "/some/path/รายงานการใช้เวชภัณฑ์ (01 Mar. 2026 - 05 Apr. 2026).xlsx",
+        )
+        .expect("should parse");
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 4, 5).unwrap());
+    }
+
+    #[test]
+    fn parse_filename_date_range_handles_single_digit_day() {
+        let (start, end) =
+            parse_filename_date_range("(1 Mar. 2026 - 5 Apr. 2026).xlsx").expect("should parse");
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 4, 5).unwrap());
+    }
+
+    fn make_row(date: NaiveDate, time_h: u32, time_m: u32) -> LedgerRow {
+        let naive = date.and_hms_opt(time_h, time_m, 0).unwrap();
+        LedgerRow {
+            product_id: "P001".to_string(),
+            department_id: "ER".to_string(),
+            dispensed_amount: Decimal::ONE,
+            transaction_date: DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc),
+        }
+    }
+
+    #[test]
+    fn repair_swaps_corrupted_excel_native_date_into_range() {
+        let range = (
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        );
+        let mut rows = vec![make_row(
+            NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
+            14,
+            30,
+        )];
+        let sources = vec![DateSource::ExcelNative];
+        let count = repair_excel_corrupted_dates(&mut rows, &sources, range);
+        assert_eq!(count, 1);
+        assert_eq!(
+            rows[0].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 3).unwrap()
+        );
+        assert_eq!(rows[0].transaction_date.hour(), 14);
+        assert_eq!(rows[0].transaction_date.minute(), 30);
+    }
+
+    #[test]
+    fn repair_preserves_string_source_dates() {
+        let range = (
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        );
+        let mut rows = vec![make_row(
+            NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(),
+            14,
+            30,
+        )];
+        let sources = vec![DateSource::StringSource];
+        let count = repair_excel_corrupted_dates(&mut rows, &sources, range);
+        assert_eq!(count, 0);
+        assert_eq!(
+            rows[0].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 3, 4).unwrap()
+        );
+    }
+
+    #[test]
+    fn repair_skips_dates_already_within_range() {
+        let range = (
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        );
+        let mut rows = vec![make_row(
+            NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(),
+            10,
+            0,
+        )];
+        let sources = vec![DateSource::ExcelNative];
+        let count = repair_excel_corrupted_dates(&mut rows, &sources, range);
+        assert_eq!(count, 0);
+        assert_eq!(
+            rows[0].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn repair_skips_when_swap_still_outside_range() {
+        let range = (
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        );
+        let mut rows = vec![make_row(
+            NaiveDate::from_ymd_opt(2026, 6, 2).unwrap(),
+            10,
+            0,
+        )];
+        let sources = vec![DateSource::ExcelNative];
+        let count = repair_excel_corrupted_dates(&mut rows, &sources, range);
+        assert_eq!(count, 0);
+        assert_eq!(
+            rows[0].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 6, 2).unwrap()
+        );
+    }
+
+    #[test]
+    fn repair_skips_when_day_exceeds_12() {
+        let range = (
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        );
+        let mut rows = vec![make_row(
+            NaiveDate::from_ymd_opt(2026, 5, 15).unwrap(),
+            10,
+            0,
+        )];
+        let sources = vec![DateSource::ExcelNative];
+        let count = repair_excel_corrupted_dates(&mut rows, &sources, range);
+        assert_eq!(count, 0);
+        assert_eq!(
+            rows[0].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 5, 15).unwrap()
+        );
+    }
+
+    #[test]
+    fn repair_handles_mixed_sources_and_dates() {
+        let range = (
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        );
+        let mut rows = vec![
+            make_row(NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(), 8, 0),
+            make_row(NaiveDate::from_ymd_opt(2026, 4, 1).unwrap(), 9, 0),
+            make_row(NaiveDate::from_ymd_opt(2026, 3, 4).unwrap(), 10, 0),
+        ];
+        let sources = vec![
+            DateSource::ExcelNative,
+            DateSource::ExcelNative,
+            DateSource::StringSource,
+        ];
+        let count = repair_excel_corrupted_dates(&mut rows, &sources, range);
+        assert_eq!(count, 1);
+        assert_eq!(
+            rows[0].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 3).unwrap()
+        );
+        assert_eq!(
+            rows[1].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()
+        );
+        assert_eq!(
+            rows[2].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 3, 4).unwrap()
+        );
+    }
+
+    #[test]
+    fn repair_returns_zero_for_empty_input() {
+        let range = (
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        );
+        let mut rows: Vec<LedgerRow> = vec![];
+        let sources: Vec<DateSource> = vec![];
+        let count = repair_excel_corrupted_dates(&mut rows, &sources, range);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn repair_cross_month_corruption() {
+        let range = (
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        );
+        let mut rows = vec![make_row(
+            NaiveDate::from_ymd_opt(2026, 4, 3).unwrap(),
+            14,
+            30,
+        )];
+        let sources = vec![DateSource::ExcelNative];
+        let count = repair_excel_corrupted_dates(&mut rows, &sources, range);
+        assert_eq!(count, 0);
+        assert_eq!(
+            rows[0].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 3).unwrap()
+        );
+    }
+
+    #[test]
+    fn repair_boundary_start_date() {
+        let range = (
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        );
+        let mut rows = vec![make_row(
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            8,
+            0,
+        )];
+        let sources = vec![DateSource::ExcelNative];
+        let count = repair_excel_corrupted_dates(&mut rows, &sources, range);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn repair_boundary_end_date() {
+        let range = (
+            NaiveDate::from_ymd_opt(2026, 3, 30).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+        );
+        let mut rows = vec![make_row(
+            NaiveDate::from_ymd_opt(2026, 4, 5).unwrap(),
+            23,
+            59,
+        )];
+        let sources = vec![DateSource::ExcelNative];
+        let count = repair_excel_corrupted_dates(&mut rows, &sources, range);
+        assert_eq!(count, 0);
+    }
+
+    #[test]
     fn parse_excel_file_skips_invalid_rows_and_keeps_valid_rows() {
         let temp = tempdir().expect("tempdir should be created");
         let workbook_path = temp.path().join("rows_validation.xlsx");
@@ -3056,5 +3469,216 @@ mod tests {
 
         assert!(!res.is_fallback());
         assert_eq!(res.date(), expected_utc);
+    }
+
+    #[test]
+    fn parse_excel_file_repairs_corrupted_excel_native_dates_using_filename_anchor() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workbook_path = temp.path().join("(30 Mar. 2026 - 05 Apr. 2026).xlsx");
+
+        let config = Config {
+            database_path: temp.path().join("state.db"),
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(2, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("P001").expect("sheet name");
+        sheet
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .unwrap();
+        sheet
+            .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Consume Department")
+            .unwrap();
+        sheet.write_string(0, CODE_COL_IDX as u16, "Code").unwrap();
+        sheet.write_string(0, QTY_COL_IDX as u16, "Qty").unwrap();
+
+        let corrupted_dt = rust_xlsxwriter::ExcelDateTime::parse_from_str("2026-03-04T14:30:00")
+            .expect("corrupted date");
+        sheet
+            .write_datetime(1, DATE_VISIT_COL_IDX as u16, &corrupted_dt)
+            .unwrap();
+        sheet
+            .write_string(1, CONSUME_DEPARTMENT_COL_IDX as u16, "ER")
+            .unwrap();
+        sheet.write_string(1, CODE_COL_IDX as u16, "P001").unwrap();
+        sheet.write_number(1, QTY_COL_IDX as u16, 5.0).unwrap();
+
+        let uncorrupted_dt = rust_xlsxwriter::ExcelDateTime::parse_from_str("2026-04-01T09:00:00")
+            .expect("uncorrupted date");
+        sheet
+            .write_datetime(2, DATE_VISIT_COL_IDX as u16, &uncorrupted_dt)
+            .unwrap();
+        sheet
+            .write_string(2, CONSUME_DEPARTMENT_COL_IDX as u16, "ER")
+            .unwrap();
+        sheet.write_string(2, CODE_COL_IDX as u16, "P001").unwrap();
+        sheet.write_number(2, QTY_COL_IDX as u16, 3.0).unwrap();
+
+        workbook.save(&workbook_path).expect("workbook saved");
+
+        let parsed = parse_excel_file(&workbook_path, &config).expect("parse should succeed");
+        assert_eq!(parsed.rows.len(), 2);
+
+        assert_eq!(
+            parsed.rows[0].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 3).unwrap()
+        );
+        assert_eq!(parsed.rows[0].transaction_date.hour(), 14);
+        assert_eq!(parsed.rows[0].transaction_date.minute(), 30);
+        assert_eq!(parsed.rows[0].dispensed_amount, Decimal::new(5, 0));
+
+        assert_eq!(
+            parsed.rows[1].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()
+        );
+        assert_eq!(parsed.rows[1].dispensed_amount, Decimal::new(3, 0));
+
+        assert_eq!(
+            parsed.earliest_transaction_utc.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_excel_file_does_not_repair_when_filename_has_no_range() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workbook_path = temp.path().join("report_no_dates.xlsx");
+
+        let config = Config {
+            database_path: temp.path().join("state.db"),
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(2, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("P001").expect("sheet name");
+        sheet
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .unwrap();
+        sheet
+            .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Consume Department")
+            .unwrap();
+        sheet.write_string(0, CODE_COL_IDX as u16, "Code").unwrap();
+        sheet.write_string(0, QTY_COL_IDX as u16, "Qty").unwrap();
+
+        let corrupted_dt = rust_xlsxwriter::ExcelDateTime::parse_from_str("2026-03-04T14:30:00")
+            .expect("corrupted date");
+        sheet
+            .write_datetime(1, DATE_VISIT_COL_IDX as u16, &corrupted_dt)
+            .unwrap();
+        sheet
+            .write_string(1, CONSUME_DEPARTMENT_COL_IDX as u16, "ER")
+            .unwrap();
+        sheet.write_string(1, CODE_COL_IDX as u16, "P001").unwrap();
+        sheet.write_number(1, QTY_COL_IDX as u16, 5.0).unwrap();
+
+        workbook.save(&workbook_path).expect("workbook saved");
+
+        let parsed = parse_excel_file(&workbook_path, &config).expect("parse should succeed");
+        assert_eq!(parsed.rows.len(), 1);
+        assert_eq!(
+            parsed.rows[0].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 3, 4).unwrap()
+        );
+    }
+
+    #[test]
+    fn parse_excel_file_mixed_string_and_corrupted_native_dates_repair() {
+        let temp = tempdir().expect("tempdir should be created");
+        let workbook_path = temp.path().join("(30 Mar. 2026 - 05 Apr. 2026).xlsx");
+
+        let config = Config {
+            database_path: temp.path().join("state.db"),
+            settings: Settings {
+                strict_chronological: true,
+            },
+            column_names: ColumnNames::default(),
+            products: vec![ProductConfig {
+                id: "P001".to_string(),
+                display_name: "Product 001".to_string(),
+                unit: "Box".to_string(),
+                subunit: "Piece".to_string(),
+                factor: Decimal::new(2, 0),
+                track_subunits: true,
+            }],
+            departments: BTreeMap::from([("ER".to_string(), "Emergency".to_string())]),
+        };
+
+        let mut workbook = Workbook::new();
+        let sheet = workbook.add_worksheet();
+        sheet.set_name("P001").expect("sheet name");
+        sheet
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .unwrap();
+        sheet
+            .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Consume Department")
+            .unwrap();
+        sheet.write_string(0, CODE_COL_IDX as u16, "Code").unwrap();
+        sheet.write_string(0, QTY_COL_IDX as u16, "Qty").unwrap();
+
+        let corrupted_dt = rust_xlsxwriter::ExcelDateTime::parse_from_str("2026-03-04T08:00:00")
+            .expect("corrupted date");
+        sheet
+            .write_datetime(1, DATE_VISIT_COL_IDX as u16, &corrupted_dt)
+            .unwrap();
+        sheet
+            .write_string(1, CONSUME_DEPARTMENT_COL_IDX as u16, "ER")
+            .unwrap();
+        sheet.write_string(1, CODE_COL_IDX as u16, "P001").unwrap();
+        sheet.write_number(1, QTY_COL_IDX as u16, 5.0).unwrap();
+
+        sheet
+            .write_string(2, DATE_VISIT_COL_IDX as u16, "02-04-2569 10:00")
+            .unwrap();
+        sheet
+            .write_string(2, CONSUME_DEPARTMENT_COL_IDX as u16, "ER")
+            .unwrap();
+        sheet.write_string(2, CODE_COL_IDX as u16, "P001").unwrap();
+        sheet.write_number(2, QTY_COL_IDX as u16, 3.0).unwrap();
+
+        workbook.save(&workbook_path).expect("workbook saved");
+
+        let parsed = parse_excel_file(&workbook_path, &config).expect("parse should succeed");
+        assert_eq!(parsed.rows.len(), 2);
+
+        assert_eq!(
+            parsed.rows[0].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 3).unwrap()
+        );
+
+        assert_eq!(
+            parsed.rows[1].transaction_date.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 2).unwrap()
+        );
+
+        assert_eq!(
+            parsed.earliest_transaction_utc.date_naive(),
+            NaiveDate::from_ymd_opt(2026, 4, 2).unwrap()
+        );
     }
 }

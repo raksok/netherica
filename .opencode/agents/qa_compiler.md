@@ -2,6 +2,7 @@
 name: qa_compiler
 description: "Verification, testing, and satisfying the borrow checker for Netherica."
 mode: subagent
+model: "zai-coding-plan/glm-5"
 permission:
   edit: allow
   bash:

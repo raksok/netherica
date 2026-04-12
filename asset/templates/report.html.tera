@@ -195,8 +195,8 @@
             <th class="num" style="width: 9%;">ขอยืม</th>
             <th class="num" style="width: 12%;">เบิก<br><span class="header-subunit">({{ row.subunit }})</span></th>
             <th class="num" style="width: 8%;">จ่าย</th>
-            <th class="num" style="width: 9%;">ยอดยกไป</th>
             <th style="width: 9%;">unit</th>
+            <th class="num" style="width: 9%;">ยอดยกไป<br><span class="header-subunit">({{ row.subunit }})</span></th>
           </tr>
         </thead>
         <tbody>
@@ -208,8 +208,8 @@
             <td class="num">{{ dept.borrowed }}</td>
             <td class="num">{{ dept.dispensed }}</td>
             <td class="num">{{ dept.issued }}</td>
-            <td class="num">{{ dept.closing_leftover }}</td>
             <td>{{ dept.unit }}</td>
+            <td class="num">{{ dept.closing_leftover }}</td>
           </tr>
           {% endfor %}
         </tbody>
