@@ -561,13 +561,13 @@ mod tests {
         assert!(html.contains("Generated at (BE, local):"));
         assert!(html.contains("A4 landscape"));
 
+        let unit_header_idx = html.find("unit</th>").expect("unit header should appear");
         let closing_header_idx = html
             .find("ยอดยกไป")
             .expect("closing leftover header should appear");
-        let unit_header_idx = html.find("unit</th>").expect("unit header should appear");
         assert!(
-            closing_header_idx < unit_header_idx,
-            "closing leftover column must be rendered before unit"
+            unit_header_idx < closing_header_idx,
+            "closing leftover column must be rendered after unit"
         );
 
         let header_count = html.matches("Processed filename:").count();
@@ -666,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn renders_department_closing_leftover_before_unit_column() {
+    fn renders_department_closing_leftover_after_unit_column() {
         let input = ReportRenderInput {
             source_filename: "sample.xlsx".to_string(),
             file_hash: "hash3".to_string(),
@@ -719,33 +719,33 @@ mod tests {
         assert!(html.contains("<td class=\"num\">208</td>"));
 
         let er_row_idx = html.find("<td>ER_ROW</td>").expect("ER row should appear");
-        let er_closing_idx = html[er_row_idx..]
-            .find("<td class=\"num\">104</td>")
-            .map(|idx| er_row_idx + idx)
-            .expect("ER closing leftover should appear");
         let er_unit_idx = html[er_row_idx..]
             .find("<td>PAIR</td>")
             .map(|idx| er_row_idx + idx)
             .expect("ER unit should appear");
+        let er_closing_idx = html[er_row_idx..]
+            .find("<td class=\"num\">104</td>")
+            .map(|idx| er_row_idx + idx)
+            .expect("ER closing leftover should appear");
         assert!(
-            er_closing_idx < er_unit_idx,
-            "ER closing leftover cell must be before unit cell"
+            er_unit_idx < er_closing_idx,
+            "ER closing leftover cell must be after unit cell"
         );
 
         let icu_row_idx = html
             .find("<td>ICU_ROW</td>")
             .expect("ICU row should appear");
-        let icu_closing_idx = html[icu_row_idx..]
-            .find("<td class=\"num\">208</td>")
-            .map(|idx| icu_row_idx + idx)
-            .expect("ICU closing leftover should appear");
         let icu_unit_idx = html[icu_row_idx..]
             .find("<td>PAIR</td>")
             .map(|idx| icu_row_idx + idx)
             .expect("ICU unit should appear");
+        let icu_closing_idx = html[icu_row_idx..]
+            .find("<td class=\"num\">208</td>")
+            .map(|idx| icu_row_idx + idx)
+            .expect("ICU closing leftover should appear");
         assert!(
-            icu_closing_idx < icu_unit_idx,
-            "ICU closing leftover cell must be before unit cell"
+            icu_unit_idx < icu_closing_idx,
+            "ICU closing leftover cell must be after unit cell"
         );
     }
 

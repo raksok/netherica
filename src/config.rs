@@ -83,7 +83,7 @@ fn default_settings() -> Settings {
 
 fn default_column_names() -> ColumnNames {
     ColumnNames {
-        date_visit: "Date Visit".to_string(),
+        date_visit: "Order Date".to_string(),
         consume_department: "Consume Department".to_string(),
         code: "Code".to_string(),
         qty: "Qty".to_string(),
@@ -285,7 +285,7 @@ impl Config {
 strict_chronological = true
 
 [column_names]
-date_visit = "Date Visit"
+date_visit = "Order Date"
 consume_department = "Consume Department"
 code = "Code"
 qty = "Qty"
@@ -450,7 +450,7 @@ mod tests {
 strict_chronological = true
 
 [column_names]
-date_visit = "Date Visit"
+date_visit = "Order Date"
 consume_department = "Consume Department"
 code = "Code"
 qty = "Qty"
@@ -475,7 +475,7 @@ track_subunits = true
         config.validate().expect("config should validate");
 
         assert!(config.settings.strict_chronological);
-        assert_eq!(config.column_names.date_visit, "Date Visit");
+        assert_eq!(config.column_names.date_visit, "Order Date");
         assert_eq!(config.column_names.consume_department, "Consume Department");
         assert_eq!(config.column_names.code, "Code");
         assert_eq!(config.column_names.qty, "Qty");
@@ -602,7 +602,7 @@ track_subunits = true
 
         let config = Config::from_toml_str(toml).expect("parsing should succeed");
         config.validate().expect("validation should succeed");
-        assert_eq!(config.column_names.date_visit, "Date Visit");
+        assert_eq!(config.column_names.date_visit, "Order Date");
         assert_eq!(config.column_names.consume_department, "Consume Department");
         assert_eq!(config.column_names.code, "Code");
         assert_eq!(config.column_names.qty, "Qty");

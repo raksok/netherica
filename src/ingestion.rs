@@ -2497,7 +2497,7 @@ mod tests {
         let sheet = workbook.add_worksheet();
         sheet.set_name("P001").expect("sheet name should be set");
         sheet
-            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Order Date")
             .expect("header should be written");
         sheet
             .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Consume Department")
@@ -2606,7 +2606,7 @@ mod tests {
             .expect("sheet name should be set");
 
         worksheet
-            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Order Date")
             .expect("header should be written");
         worksheet
             .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Consume Department")
@@ -2935,7 +2935,7 @@ mod tests {
         let sheet = workbook.add_worksheet();
         sheet.set_name("P001").expect("sheet name should be set");
         sheet
-            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Order Date")
             .expect("header should be written");
         sheet
             .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Consume Department")
@@ -3052,7 +3052,7 @@ mod tests {
         let sheet = workbook.add_worksheet();
         sheet.set_name("P001").expect("sheet name should be set");
         sheet
-            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Order Date")
             .expect("header should be written");
         sheet
             .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Consume Department")
@@ -3210,7 +3210,7 @@ mod tests {
         let sheet = workbook.add_worksheet();
         sheet.set_name("P001").expect("sheet name should be set");
         sheet
-            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Order Date")
             .expect("header should be written");
         sheet
             .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Department")
@@ -3262,7 +3262,7 @@ mod tests {
         let sheet = workbook.add_worksheet();
         sheet.set_name("P001").expect("sheet name should be set");
         sheet
-            .write_string(0, DATE_VISIT_COL_IDX as u16, "  date visit ")
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "  order date ")
             .expect("header should be written");
         sheet
             .write_string(
@@ -3497,7 +3497,7 @@ mod tests {
         let sheet = workbook.add_worksheet();
         sheet.set_name("P001").expect("sheet name");
         sheet
-            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Order Date")
             .unwrap();
         sheet
             .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Consume Department")
@@ -3578,7 +3578,7 @@ mod tests {
         let sheet = workbook.add_worksheet();
         sheet.set_name("P001").expect("sheet name");
         sheet
-            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Order Date")
             .unwrap();
         sheet
             .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Consume Department")
@@ -3633,7 +3633,7 @@ mod tests {
         let sheet = workbook.add_worksheet();
         sheet.set_name("P001").expect("sheet name");
         sheet
-            .write_string(0, DATE_VISIT_COL_IDX as u16, "Date Visit")
+            .write_string(0, DATE_VISIT_COL_IDX as u16, "Order Date")
             .unwrap();
         sheet
             .write_string(0, CONSUME_DEPARTMENT_COL_IDX as u16, "Consume Department")
