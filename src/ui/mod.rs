@@ -13,24 +13,39 @@ use std::sync::mpsc;
 use std::thread;
 use tracing::warn;
 
+const UI_PRIMARY_FONT_NAME: &str = "inter_variable";
+const UI_PRIMARY_FONT_BYTES: &[u8] =
+    include_bytes!("../../asset/fonts/Inter/Inter-VariableFont_opsz,wght.ttf");
 const UI_THAI_FONT_NAME: &str = "noto_sans_thai_looped_regular";
-const UI_THAI_FONT_BYTES: &[u8] = include_bytes!("../../asset/NotoSansThaiLooped-Regular.ttf");
+const UI_THAI_FONT_BYTES: &[u8] =
+    include_bytes!("../../asset/fonts/NotoSansThaiLooped/NotoSansThaiLooped-Regular.ttf");
 
 fn build_font_definitions_with_utf8_support() -> egui::FontDefinitions {
     let mut fonts = egui::FontDefinitions::default();
 
     fonts.font_data.insert(
+        UI_PRIMARY_FONT_NAME.to_string(),
+        egui::FontData::from_static(UI_PRIMARY_FONT_BYTES),
+    );
+    fonts.font_data.insert(
         UI_THAI_FONT_NAME.to_string(),
         egui::FontData::from_static(UI_THAI_FONT_BYTES),
     );
 
-    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .insert(0, UI_THAI_FONT_NAME.to_string());
-    }
+    let proportional = fonts
+        .families
+        .entry(egui::FontFamily::Proportional)
+        .or_default();
+    proportional.retain(|font| font != UI_PRIMARY_FONT_NAME && font != UI_THAI_FONT_NAME);
+    proportional.insert(0, UI_THAI_FONT_NAME.to_string());
+    proportional.insert(0, UI_PRIMARY_FONT_NAME.to_string());
+
+    let monospace = fonts
+        .families
+        .entry(egui::FontFamily::Monospace)
+        .or_default();
+    monospace.retain(|font| font != UI_THAI_FONT_NAME);
+    monospace.push(UI_THAI_FONT_NAME.to_string());
 
     fonts
 }
@@ -965,25 +980,42 @@ mod tests {
     }
 
     #[test]
-    fn font_definitions_register_noto_sans_thai_looped_with_fallbacks_preserved() {
+    fn font_definitions_register_ui_primary_and_thai_fallback_fonts() {
         let fonts = build_font_definitions_with_utf8_support();
 
+        assert!(fonts.font_data.contains_key(UI_PRIMARY_FONT_NAME));
         assert!(fonts.font_data.contains_key(UI_THAI_FONT_NAME));
 
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            let family_fonts = fonts
-                .families
-                .get(&family)
-                .expect("default family should exist");
+        let proportional_fonts = fonts
+            .families
+            .get(&egui::FontFamily::Proportional)
+            .expect("proportional family should exist");
+        assert_eq!(
+            proportional_fonts.first().map(String::as_str),
+            Some(UI_PRIMARY_FONT_NAME)
+        );
+        assert!(
+            proportional_fonts
+                .iter()
+                .any(|font| font == UI_THAI_FONT_NAME),
+            "thai fallback should remain available for proportional text"
+        );
+        assert!(
+            proportional_fonts.len() > 2,
+            "default proportional fallback fonts should remain available"
+        );
 
-            assert_eq!(
-                family_fonts.first().map(String::as_str),
-                Some(UI_THAI_FONT_NAME)
-            );
-            assert!(
-                family_fonts.len() > 1,
-                "default fallback fonts should remain available"
-            );
-        }
+        let monospace_fonts = fonts
+            .families
+            .get(&egui::FontFamily::Monospace)
+            .expect("monospace family should exist");
+        assert!(
+            monospace_fonts.iter().any(|font| font == UI_THAI_FONT_NAME),
+            "thai fallback should remain available for monospace text"
+        );
+        assert!(
+            monospace_fonts.len() > 1,
+            "default monospace fallback fonts should remain available"
+        );
     }
 }

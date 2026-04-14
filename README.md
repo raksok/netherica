@@ -40,7 +40,7 @@ The rest is LLMs generated. Basically, you will be able to compile this just fin
 - Writes archived source files to `archive/` and generated HTML reports to `reports/`.
 - Embeds report assets using `rust-embed` from `asset/`:
   - `templates/report.html.tera`
-  - `Sarabun-Regular.ttf`
+  - `fonts/Sarabun/Sarabun-Regular.ttf`
 
 Because assets are embedded at compile time, distribution binaries do **not** require an external `asset/` folder at runtime.
 

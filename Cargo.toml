@@ -18,7 +18,7 @@ tera = "1.20"
 anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
-rust-embed = "8.11"
+rust-embed = { version = "8.11", features = ["include-exclude"] }
 base64 = "0.22"
 egui_extras = "0.28"
 encoding_rs = "0.8"

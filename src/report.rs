@@ -14,11 +14,12 @@ use std::path::{Path, PathBuf};
 use tera::{Context, Tera};
 
 const REPORT_TEMPLATE_PATH: &str = "templates/report.html.tera";
-const THAI_FONT_PATH: &str = "Sarabun-Regular.ttf";
+const THAI_FONT_PATH: &str = "fonts/Sarabun/Sarabun-Regular.ttf";
 const REPORT_VERSION: &str = "v0.2.2";
 
 #[derive(RustEmbed)]
 #[folder = "asset/"]
+#[exclude = "*.xlsx"]
 struct ReportAssets;
 
 #[derive(Debug, Clone)]
