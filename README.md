@@ -1,10 +1,10 @@
-# Netherica v0.1
+# Netherica v0.2
 
 Netherica is a Rust desktop ingestion/reporting application (egui/eframe) for Excel-based inventory flow. In its basic form a tool like Grist could probably manage this just fine. This exists purely as me dipping my toe into the 'vibe coding' everybody talks about. 
 
 Most of it written in opencode. Main coder is Gemma 4 26B A4B UD-IQ3_S limit context to 70k token to prevent memory overflow on my 7800XT using llama.cpp as inference engine (I could not figure out how to make sgLang or vLLM work with my machine yet) 
 
-When Gemma 4 can't handle the task, the task is handed over to GPT-5.3 Codex (high) which also handle debugging.
+When Gemma 4 can't handle the task, the task is handed over to GPT-5.4 (xhigh) for planing or GLM-5.1 when hit Codex limit, they also handle debugging. Coder mainly Gemma 4 26B and later GPT-5.3 Codex or GLM-5 or GLM-4.7 depends on avaialbility.
 
 **The process of creation follows**
 
@@ -32,91 +32,29 @@ When Gemma 4 can't handle the task, the task is handed over to GPT-5.3 Codex (hi
 
 The rest is LLMs generated. Basically, you will be able to compile this just fine with rust MSVC on Windows (YOYO if you're using MYSYS or MINGW) Linux version compiled and test on Fedora 43 KDE with stable rustup and development-tools group installed.
 
+**UI Rework**
+- Again everything draft then refine by LLMs, even all prompt and subagent files also drafted by LLM. The design also generate by Stitch then basically follow the same process of Orchestrator-->Engineer-->QA loop.
+- The hardest part is when agent want to check if the UI behave properly a lot of screenshot were taken at somepoint I start to think that maybe it'd be faster if I do the UI part myself, but I push through with AI, so some elements especially on parsing screen may still be rough around the edge, some element might jump around, but does not effect the workflow.
+- Well yeah, I doubt anyone will find use for the exept me anyway.
 
 ## Runtime behavior
 
 - Loads `config.toml` (auto-generates a default config on first run).
 - Uses SQLite (`state.db`) with WAL mode.
-- Writes archived source files to `archive/` and generated HTML reports to `reports/`.
+- Writes archived source files to `archive/` and generated HTML reports to `reports/`. 
+- In case local folder can't be create. The default fall back in Windows is `%APPDATA%\netherica\archive` and  `%APPDATA%\netherica\reports`. on Linux `~/.local/share/Netherica/archive` and `~/.local/share/Netherica/reports`
 - Embeds report assets using `rust-embed` from `asset/`:
   - `templates/report.html.tera`
   - `fonts/Sarabun/Sarabun-Regular.ttf`
+  - `fonts/NotoSansThaiLooped/NotoSansThaiLoop.ttf`
+  - `font/Inter/Inter.ttf'`
 
 Because assets are embedded at compile time, distribution binaries do **not** require an external `asset/` folder at runtime.
 
-## Local development
+## How to Builds
 
-```bash
-cargo test --locked
-cargo run --locked
+Clone the repo the run
 ```
-
-## Build & distribution
-
-The repository includes scripts to produce release artifacts in `dist/`:
-
-- Windows (MSVC, static CRT): `scripts/build-windows-msvc.ps1`
-- Linux (musl, static): `scripts/build-linux-musl.sh`
-
-### 1) Windows MSVC static binary
-
-PowerShell:
-
-```powershell
-./scripts/build-windows-msvc.ps1
+cargo build --release
 ```
-
-Output:
-
-- `dist/windows-msvc/netherica.exe`
-- `dist/windows-msvc/SHA256SUMS.txt`
-
-### 2) Linux musl static binary
-
-Bash (Linux host):
-
-Prerequisites (required for reproducible musl builds):
-
-1. Install Rust + target:
-
-```bash
-rustup toolchain install stable
-rustup target add x86_64-unknown-linux-musl
-```
-
-2. Install musl C toolchain providing `x86_64-linux-musl-gcc`:
-
-- Debian/Ubuntu: `sudo apt-get install -y musl-tools`
-- Fedora: `sudo dnf install -y musl-gcc`
-- Alpine: `sudo apk add musl-dev musl-tools`
-
-```bash
-chmod +x scripts/build-linux-musl.sh
-./scripts/build-linux-musl.sh
-```
-
-Output:
-
-- `dist/linux-musl/netherica`
-- `dist/linux-musl/SHA256SUMS.txt`
-
-## Reproducible build guidance
-
-Use the same Rust channel and locked dependencies:
-
-- Recommended linker config is included in `.cargo/config.toml`:
-  - target: `x86_64-unknown-linux-musl`
-  - linker: `x86_64-linux-musl-gcc`
-
-```bash
-rustup toolchain install stable
-rustup target add x86_64-unknown-linux-musl
-cargo build --locked --release --target x86_64-unknown-linux-musl
-```
-
-```powershell
-$env:RUSTFLAGS = "-C target-feature=+crt-static"
-cargo build --locked --release --target x86_64-pc-windows-msvc
-```
-
-Then compare checksums with `SHA256SUMS.txt`.
+Only executable is need to be coppy.

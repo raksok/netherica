@@ -11,3 +11,4 @@ target
 
 # Personal-data sample spreadsheets
 /asset/**/*.xlsx
+.gemini/
