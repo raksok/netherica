@@ -2,7 +2,7 @@
 name: engineer
 description: "Primary implementation agent responsible for writing Netherica Rust code."
 mode: subagent
-model: "zai-coding-plan/glm-5"
+model: "openai/gpt-5.3-codex"
 permission:
   edit: allow
   bash:

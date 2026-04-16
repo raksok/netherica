@@ -1,150 +1,54 @@
+mod components;
+mod sidebar;
+pub(crate) mod theme;
+mod views;
+mod worker;
+
+pub use worker::WorkerMessage;
+
 use crate::config::Config;
 use crate::db::Database;
-use crate::domain::DryRunRow;
 use crate::ingestion;
 use crate::report;
 use crate::repository::Repository;
 use crate::storage::DataDirectory;
+use chrono::{DateTime, Utc};
 use eframe::egui;
-use egui_extras::{Column, TableBuilder};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
-use std::thread;
+use std::time::{Duration, Instant};
 use tracing::warn;
-
-const UI_PRIMARY_FONT_NAME: &str = "inter_variable";
-const UI_PRIMARY_FONT_BYTES: &[u8] =
-    include_bytes!("../../asset/fonts/Inter/Inter-VariableFont_opsz,wght.ttf");
-const UI_THAI_FONT_NAME: &str = "noto_sans_thai_looped_regular";
-const UI_THAI_FONT_BYTES: &[u8] =
-    include_bytes!("../../asset/fonts/NotoSansThaiLooped/NotoSansThaiLooped-Regular.ttf");
-
-fn build_font_definitions_with_utf8_support() -> egui::FontDefinitions {
-    let mut fonts = egui::FontDefinitions::default();
-
-    fonts.font_data.insert(
-        UI_PRIMARY_FONT_NAME.to_string(),
-        egui::FontData::from_static(UI_PRIMARY_FONT_BYTES),
-    );
-    fonts.font_data.insert(
-        UI_THAI_FONT_NAME.to_string(),
-        egui::FontData::from_static(UI_THAI_FONT_BYTES),
-    );
-
-    let proportional = fonts
-        .families
-        .entry(egui::FontFamily::Proportional)
-        .or_default();
-    proportional.retain(|font| font != UI_PRIMARY_FONT_NAME && font != UI_THAI_FONT_NAME);
-    proportional.insert(0, UI_THAI_FONT_NAME.to_string());
-    proportional.insert(0, UI_PRIMARY_FONT_NAME.to_string());
-
-    let monospace = fonts
-        .families
-        .entry(egui::FontFamily::Monospace)
-        .or_default();
-    monospace.retain(|font| font != UI_THAI_FONT_NAME);
-    monospace.push(UI_THAI_FONT_NAME.to_string());
-
-    fonts
-}
-
-fn configure_egui_fonts(ctx: &egui::Context) {
-    ctx.set_fonts(build_font_definitions_with_utf8_support());
-}
-
-fn apply_design_system(ctx: &egui::Context) {
-    let mut style = (*ctx.style()).clone();
-    let mut visuals = egui::Visuals::dark();
-
-    // 1. Spacing & Layout
-    // Spacing scale 2 (base 4px). item_spacing = space-3 (12px), window_margin = space-6 (24px)
-    style.spacing.item_spacing = egui::vec2(12.0, 12.0);
-    style.spacing.window_margin = egui::Margin::same(24.0);
-    style.spacing.button_padding = egui::vec2(16.0, 8.0);
-
-    // 2. Color Tokens (Nordic Precision - The Arctic Atelier)
-    let primary = egui::Color32::from_rgb(163, 220, 236); // #a3dcec
-    let surface_container_lowest = egui::Color32::from_rgb(8, 14, 25); // #080e19
-    let surface = egui::Color32::from_rgb(13, 19, 30); // #0d131e
-    let surface_container_low = egui::Color32::from_rgb(22, 28, 39); // #161c27
-    let surface_container = egui::Color32::from_rgb(26, 32, 43); // #1a202b
-    let surface_container_high = egui::Color32::from_rgb(36, 42, 54); // #242a36
-
-    let on_surface = egui::Color32::from_rgb(221, 226, 242); // #dde2f2
-    let on_surface_variant = egui::Color32::from_rgb(192, 200, 203); // #c0c8cb
-    let on_primary = egui::Color32::from_rgb(0, 54, 64); // #003640
-
-    let outline_variant_40 = egui::Color32::from_rgba_premultiplied(64, 72, 75, 102); // 40% focus ghost border
-
-    // Backgrounds
-    visuals.window_fill = surface_container_low; // Panels/windows sit on surface base
-    visuals.panel_fill = surface; // Base background
-    visuals.extreme_bg_color = surface_container_lowest; // Deep recesses, text inputs
-    visuals.faint_bg_color = surface_container_low;
-
-    // No-Line Rule
-    visuals.window_stroke = egui::Stroke::NONE;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::NONE;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::NONE;
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::NONE;
-    visuals.widgets.active.bg_stroke = egui::Stroke::NONE;
-
-    // Widget colors & interactions
-    visuals.widgets.noninteractive.bg_fill = surface_container_low;
-    visuals.widgets.noninteractive.fg_stroke.color = on_surface_variant;
-
-    visuals.widgets.inactive.bg_fill = surface_container; // Default cards/buttons
-    visuals.widgets.inactive.fg_stroke.color = on_surface;
-
-    visuals.widgets.hovered.bg_fill = surface_container_high;
-    visuals.widgets.hovered.fg_stroke.color = on_surface;
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, outline_variant_40); // Hover Ghost Border
-
-    visuals.widgets.active.bg_fill = primary;
-    visuals.widgets.active.fg_stroke.color = on_primary;
-
-    visuals.selection.bg_fill = primary;
-    visuals.selection.stroke.color = on_primary;
-
-    // Rounding & Elevation
-    let radius_md = 6.0; // Round-4 -> 6px for buttons/inputs
-    let radius_xl = 12.0; // 12px for windows/cards
-    visuals.widgets.noninteractive.rounding = egui::Rounding::same(radius_md);
-    visuals.widgets.inactive.rounding = egui::Rounding::same(radius_md);
-    visuals.widgets.hovered.rounding = egui::Rounding::same(radius_md);
-    visuals.widgets.active.rounding = egui::Rounding::same(radius_md);
-    visuals.window_rounding = egui::Rounding::same(radius_xl);
-
-    // Ambient Shadows (Tinted with black at 40%)
-    visuals.window_shadow = egui::epaint::Shadow {
-        offset: egui::vec2(0.0, 24.0),
-        blur: 48.0,
-        spread: 0.0,
-        color: egui::Color32::from_rgba_premultiplied(0, 0, 0, 102),
-    };
-    visuals.popup_shadow = visuals.window_shadow;
-
-    style.visuals = visuals;
-    ctx.set_style(style);
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AppState {
     Idle,
     Parsing,
+    ParsingHold,
     DryRun,
     Committing,
     Complete,
 }
 
-pub enum WorkerMessage {
-    Progress(String),
-    DryRunData(Vec<DryRunRow>),
-    DryRunPrepared(ingestion::PendingIngestionCommit),
-    Completed(ingestion::IngestionOutcome),
-    Error(String),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NavigationSection {
+    Ingestion,
+    Reports,
+    Settings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsTab {
+    Departments,
+    Products,
+}
+
+#[derive(Debug, Clone)]
+pub struct ParsingFileMetadata {
+    pub filename: String,
+    pub file_size: u64,
+    pub sheet_count: usize,
+    pub sheet_names: Vec<String>,
 }
 
 pub struct NethericaApp {
@@ -153,7 +57,7 @@ pub struct NethericaApp {
     pub selected_file: Option<PathBuf>,
     pub status_message: String,
     pub receiver: Option<mpsc::Receiver<WorkerMessage>>,
-    pub dry_run_data: Vec<DryRunRow>,
+    pub dry_run_data: Vec<crate::domain::DryRunRow>,
     pub pending_commit: Option<ingestion::PendingIngestionCommit>,
     pub toast_message: Option<(String, std::time::Instant)>,
     pub critical_error: Option<String>,
@@ -161,6 +65,27 @@ pub struct NethericaApp {
     pub last_report_path: Option<PathBuf>,
     pub post_generation_guidance: Option<String>,
     pub storage_fallback_warning_shown: bool,
+    pub active_section: NavigationSection,
+    pub active_settings_tab: SettingsTab,
+
+    // Step 3 (12.6): Startup summary state for Idle view
+    pub last_run_timestamp: Option<DateTime<Utc>>,
+    pub db_connected: bool,
+    pub storage_source: Option<crate::storage::DataRootSource>,
+
+    // Step 3 (12.7): Structured parsing/progress view state
+    pub parsing_logs: Vec<(String, String, String)>,
+    pub parsing_file_metadata: Option<ParsingFileMetadata>,
+    pub parsing_progress: Option<(String, usize, usize)>,
+
+    // Step 3 (12.8): Completion summary fields
+    pub completed_rows_processed: usize,
+    pub completed_filename: String,
+    pub completed_file_hash: String,
+    pub completed_archive_move_pending: bool,
+    pub pipeline_start: Option<std::time::Instant>,
+    pub dry_run_elapsed: Option<std::time::Duration>,
+    pub parse_hold_until: Option<std::time::Instant>,
 }
 
 impl NethericaApp {
@@ -179,17 +104,53 @@ impl NethericaApp {
             last_report_path: None,
             post_generation_guidance: None,
             storage_fallback_warning_shown: false,
+            active_section: NavigationSection::Ingestion,
+            active_settings_tab: SettingsTab::Departments,
+
+            // Step 3 (12.6)
+            last_run_timestamp: None,
+            db_connected: false,
+            storage_source: None,
+
+            // Step 3 (12.7)
+            parsing_logs: Vec::new(),
+            parsing_file_metadata: None,
+            parsing_progress: None,
+
+            // Step 3 (12.8)
+            completed_rows_processed: 0,
+            completed_filename: String::new(),
+            completed_file_hash: String::new(),
+            completed_archive_move_pending: false,
+            pipeline_start: None,
+            dry_run_elapsed: None,
+            parse_hold_until: None,
         }
     }
 
     pub fn new(_cc: &eframe::CreationContext<'_>, config: Config) -> Self {
-        configure_egui_fonts(&_cc.egui_ctx);
-        apply_design_system(&_cc.egui_ctx);
+        theme::configure_egui_fonts(&_cc.egui_ctx);
+        theme::apply_design_system(&_cc.egui_ctx);
 
         let mut app = Self::from_config(config);
 
+        // Step 3 (12.6): Startup probe 1 — storage source
         if let Ok(data_dir) = DataDirectory::resolve() {
+            app.storage_source = Some(data_dir.root_source);
             app.maybe_show_storage_fallback_warning(&data_dir);
+        }
+
+        // Step 3 (12.6): Startup probe 2 — database + last run timestamp
+        match Database::new(&app.config.database_path) {
+            Ok(db) => {
+                let repository = Repository::new(&db);
+                app.db_connected = true;
+                app.last_run_timestamp = repository.get_max_transaction_date().ok().flatten();
+            }
+            Err(_) => {
+                app.db_connected = false;
+                app.last_run_timestamp = None;
+            }
         }
 
         app
@@ -220,6 +181,38 @@ impl NethericaApp {
                     .unwrap_or(false))
     }
 
+    fn clear_parsing_state(&mut self) {
+        self.parsing_logs.clear();
+        self.parsing_file_metadata = None;
+        self.parsing_progress = None;
+        self.parse_hold_until = None;
+    }
+
+    fn begin_parsing_hold(&mut self) {
+        self.state = AppState::ParsingHold;
+        self.parse_hold_until = Some(Instant::now() + Duration::from_millis(900));
+    }
+
+    fn can_continue_to_dry_run(&self) -> bool {
+        self.parse_hold_until
+            .map(|until| Instant::now() >= until)
+            .unwrap_or(true)
+    }
+
+    fn finish_parsing_hold(&mut self) {
+        self.state = AppState::DryRun;
+        self.parse_hold_until = None;
+    }
+
+    fn clear_completion_state(&mut self) {
+        self.completed_rows_processed = 0;
+        self.completed_filename.clear();
+        self.completed_file_hash.clear();
+        self.completed_archive_move_pending = false;
+        self.pipeline_start = None;
+        self.dry_run_elapsed = None;
+    }
+
     fn handle_dry_run_prepared(&mut self, prepared: ingestion::PendingIngestionCommit) {
         let fallback_used = prepared.transaction_date_fallback_used;
         let warning = prepared.transaction_date_warning.clone();
@@ -232,255 +225,57 @@ impl NethericaApp {
         }
     }
 
-    fn render_idle_view(&mut self, ui: &mut egui::Ui) {
-        ui.group(|ui| {
-            ui.heading("File Ingestion");
-            ui.label("Select an Excel file (.xlsx) to begin processing.");
-
-            if ui.button("📁 Pick File").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .add_filter("Excel", &["xlsx"])
-                    .pick_file()
-                {
-                    self.selected_file = Some(path.clone());
-                    self.status_message =
-                        format!("Selected: {:?}", path.file_name().unwrap_or_default());
-                }
-            }
-
-            if let Some(path) = &self.selected_file {
-                ui.label(format!("Selected: {}", path.display()));
-                if ui.button("🚀 Start Ingestion").clicked() {
-                    self.start_ingestion_worker(path.clone());
-                }
-            }
-        });
-
-        ui.add_space(20.0);
-
-        ui.group(|ui| {
-            ui.heading("Configuration Summary");
-            ui.label(format!(
-                "Products configured: {}",
-                self.config.products.len()
-            ));
-            ui.label(format!(
-                "Departments: {}",
-                self.config
-                    .departments
-                    .iter()
-                    .map(|(code, name)| format!("{} ({})", name, code))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ));
-            ui.label(format!("Database: {:?}", self.config.database_path));
-        });
-    }
-
-    fn start_ingestion_worker(&mut self, path: PathBuf) {
-        let (tx, rx) = mpsc::channel();
-        self.receiver = Some(rx);
-        self.state = AppState::Parsing;
-        self.pending_commit = None;
-        self.fallback_acknowledged = true;
-        self.status_message = "Starting worker...".to_string();
-        let config = self.config.clone();
-
-        thread::spawn(move || {
-            let _ = tx.send(WorkerMessage::Progress(
-                "Initializing database...".to_string(),
-            ));
-            let outcome = (|| {
-                let db = Database::new(&config.database_path)?;
-                let repository = Repository::new(&db);
-
-                let _ = tx.send(WorkerMessage::Progress(
-                    "Parsing and preparing dry-run...".to_string(),
-                ));
-                ingestion::prepare_ingestion_dry_run(&path, &config, &repository)
-            })();
-
-            match outcome {
-                Ok(prepared) => {
-                    let _ = tx.send(WorkerMessage::DryRunData(prepared.dry_run_rows.clone()));
-                    let _ = tx.send(WorkerMessage::DryRunPrepared(prepared));
-                }
-                Err(err) => {
-                    let _ = tx.send(WorkerMessage::Error(err.to_string()));
-                }
-            }
-        });
-    }
-
-    fn start_commit_worker(&mut self, pending: ingestion::PendingIngestionCommit) {
-        let (tx, rx) = mpsc::channel();
-        self.receiver = Some(rx);
-        self.state = AppState::Committing;
-        self.status_message = "Committing transaction...".to_string();
-        let config = self.config.clone();
-
-        thread::spawn(move || {
-            let _ = tx.send(WorkerMessage::Progress("Opening database...".to_string()));
-            let outcome = (|| {
-                let data_dir = DataDirectory::resolve()?;
-                let db = Database::new(&config.database_path)?;
-                let repository = Repository::new(&db);
-                ingestion::commit_prepared_ingestion(
-                    &pending,
-                    &config,
-                    &repository,
-                    &data_dir.reports,
-                    &data_dir.archive,
-                )
-            })();
-
-            match outcome {
-                Ok(outcome) => {
-                    let _ = tx.send(WorkerMessage::Completed(outcome));
-                }
-                Err(err) => {
-                    let _ = tx.send(WorkerMessage::Error(err.to_string()));
-                }
-            }
-        });
-    }
-
-    fn render_dry_run_view(&mut self, ui: &mut egui::Ui) {
-        ui.vertical(|ui| {
-            ui.heading("Dry Run Preview");
-            ui.label("Review Product + Department adjustment rows before committing.");
-            ui.add_space(10.0);
-
-            if let Some(pending) = &self.pending_commit {
-                if pending.transaction_date_fallback_used {
-                    ui.colored_label(
-                        egui::Color32::YELLOW,
-                        "⚠ Some rows used file modification time (UTC) as transaction date fallback.",
-                    );
-                    if let Some(message) = &pending.transaction_date_warning {
-                        ui.label(message);
-                    }
-                    ui.checkbox(
-                        &mut self.fallback_acknowledged,
-                        "I acknowledge this fallback and want to continue with commit.",
-                    );
-                    ui.add_space(10.0);
-                }
-            }
-
-            let table_height = (ui.available_height() - 72.0).max(180.0);
-            egui::ScrollArea::vertical()
-                .max_height(table_height)
-                .show(ui, |ui| {
-                TableBuilder::new(ui)
-                    .column(Column::remainder()) // Product
-                    .column(Column::remainder()) // Department
-                    .column(Column::auto()) // Opening Leftover
-                    .column(Column::auto()) // Total Subunits Used
-                    .column(Column::auto()) // Whole Units Output
-                    .column(Column::auto()) // Closing Leftover
-                    .header(20.0, |mut header| {
-                        header.col(|ui| {
-                            ui.strong("Product");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Department");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Opening Leftover");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Total Subunits Used (Product + Department)");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Whole Units Output");
-                        });
-                        header.col(|ui| {
-                            ui.strong("Closing Leftover");
-                        });
-                    })
-                    .body(|body| {
-                        body.rows(20.0, self.dry_run_data.len(), |mut row| {
-                            let index = row.index();
-                            let row_data = &self.dry_run_data[index];
-                            row.col(|ui| {
-                                ui.label(format!(
-                                    "{} ({})",
-                                    row_data.product_display_name, row_data.product_id
-                                ));
-                            });
-                            row.col(|ui| {
-                                ui.label(format!(
-                                    "{} ({})",
-                                    row_data.department_display_name, row_data.department_id
-                                ));
-                            });
-                            row.col(|ui| {
-                                ui.label(row_data.opening_leftover.to_string());
-                            });
-                            row.col(|ui| {
-                                ui.label(row_data.total_subunits_used.to_string());
-                            });
-                            row.col(|ui| {
-                                ui.label(row_data.whole_units_output.to_string());
-                            });
-                            row.col(|ui| {
-                                ui.label(row_data.closing_leftover.to_string());
-                            });
-                        });
-                    });
-                });
-
-            ui.add_space(8.0);
-            ui.label(format!(
-                "{} adjustment row(s) (Product + Department).",
-                self.dry_run_data.len()
-            ));
-            ui.separator();
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .add_enabled(self.can_confirm_commit(), egui::Button::new("Confirm"))
-                    .clicked()
-                {
-                    if let Some(pending) = self.pending_commit.take() {
-                        self.start_commit_worker(pending);
-                    } else {
-                        self.status_message =
-                            "No prepared ingestion payload found. Please start again.".to_string();
-                        self.critical_error = Some(
-                            "Missing prepared data for commit. Please re-run dry-run.".to_string(),
-                        );
-                        self.state = AppState::Idle;
-                    }
-                }
-                if ui.button("Cancel").clicked() {
-                    self.state = AppState::Idle;
-                    self.dry_run_data.clear();
-                    self.pending_commit = None;
-                    self.fallback_acknowledged = true;
-                }
-            });
-        });
-    }
-
     fn process_worker_messages(&mut self) {
         if let Some(rx) = self.receiver.take() {
             let current_rx = rx;
             loop {
                 match current_rx.try_recv() {
                     Ok(msg) => match msg {
+                        WorkerMessage::ParsingStarted {
+                            filename,
+                            file_size,
+                            sheet_count,
+                            sheet_names,
+                        } => {
+                            self.parsing_file_metadata = Some(ParsingFileMetadata {
+                                filename,
+                                file_size,
+                                sheet_count,
+                                sheet_names,
+                            });
+                        }
+                        WorkerMessage::ParsingLog {
+                            timestamp,
+                            level,
+                            message,
+                        } => {
+                            self.parsing_logs.push((timestamp, level, message));
+                        }
+                        WorkerMessage::ParsingProgress {
+                            current_sheet,
+                            rows_processed,
+                            total_rows,
+                        } => {
+                            self.parsing_progress =
+                                Some((current_sheet, rows_processed, total_rows));
+                        }
+                        WorkerMessage::DryRunTimingComplete { elapsed } => {
+                            self.dry_run_elapsed = Some(elapsed);
+                        }
                         WorkerMessage::Progress(progress) => {
                             self.status_message = progress;
                         }
                         WorkerMessage::DryRunData(data) => {
                             self.dry_run_data = data;
-                            self.state = AppState::DryRun;
                         }
                         WorkerMessage::DryRunPrepared(prepared) => {
                             self.handle_dry_run_prepared(prepared);
+                            self.begin_parsing_hold();
                         }
                         WorkerMessage::Completed(outcome) => {
+                            // Step 3 (12.8): Capture completion snapshot before report-ready flow
+                            self.completed_archive_move_pending = outcome.archive_move_pending;
+
                             self.handle_report_ready(outcome.report_path.clone(), "generated");
 
                             if outcome.archive_move_pending {
@@ -523,8 +318,8 @@ impl NethericaApp {
 
     fn regenerate_last_report(&mut self) {
         let outcome = (|| {
-            let db = Database::new(&self.config.database_path)?;
-            let repository = Repository::new(&db);
+            let db = crate::db::Database::new(&self.config.database_path)?;
+            let repository = crate::repository::Repository::new(&db);
             let data_dir = DataDirectory::resolve()?;
             report::regenerate_last_report(&repository, &self.config, &data_dir.reports)
         })();
@@ -620,6 +415,163 @@ impl NethericaApp {
             }
         }
     }
+
+    fn render_toast_overlay(&mut self, ctx: &egui::Context) {
+        let Some((message, shown_at)) = self.toast_message.clone() else {
+            return;
+        };
+
+        if shown_at.elapsed() > std::time::Duration::from_secs(5) {
+            self.toast_message = None;
+            return;
+        }
+
+        let mut dismiss = false;
+
+        egui::Area::new(egui::Id::new("toast_overlay"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+            .show(ctx, |ui| {
+                components::overlay_card_frame(theme::SURFACE_CONTAINER_HIGHEST).show(ui, |ui| {
+                    ui.set_max_width(520.0);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new("Notice")
+                                .size(11.0)
+                                .strong()
+                                .color(theme::ON_SURFACE_VARIANT),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if components::ghost_button(
+                                ui,
+                                egui::RichText::new("Close")
+                                    .size(11.0)
+                                    .color(theme::ON_SURFACE_VARIANT),
+                            )
+                            .clicked()
+                            {
+                                dismiss = true;
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(message).color(theme::ON_SURFACE));
+                });
+            });
+
+        if dismiss {
+            self.toast_message = None;
+        }
+    }
+
+    fn render_error_overlay(&mut self, ctx: &egui::Context) {
+        let Some(error_message) = self.critical_error.clone() else {
+            return;
+        };
+
+        let mut close = false;
+
+        egui::Area::new(egui::Id::new("error_overlay_scrim"))
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .movable(false)
+            .anchor(egui::Align2::LEFT_TOP, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.screen_rect();
+                ui.painter().rect_filled(rect, 0.0, theme::MODAL_OVERLAY);
+            });
+
+        egui::Area::new(egui::Id::new("error_overlay_modal"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                components::overlay_card_frame(theme::SURFACE_CONTAINER_HIGH).show(ui, |ui| {
+                    ui.set_width(560.0);
+                    ui.label(
+                        egui::RichText::new("Error")
+                            .size(22.0)
+                            .strong()
+                            .color(theme::ERROR),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new(error_message).color(theme::ON_SURFACE));
+                    ui.add_space(16.0);
+                    if components::primary_button(
+                        ui,
+                        egui::RichText::new("Close").color(theme::ON_PRIMARY_CONTAINER),
+                    )
+                    .clicked()
+                    {
+                        close = true;
+                    }
+                });
+            });
+
+        if close {
+            self.critical_error = None;
+        }
+    }
+
+    fn render_report_ready_overlay(&mut self, ctx: &egui::Context) {
+        let Some(message) = self.post_generation_guidance.clone() else {
+            return;
+        };
+
+        let mut close = false;
+
+        egui::Area::new(egui::Id::new("report_ready_overlay_scrim"))
+            .order(egui::Order::Foreground)
+            .interactable(true)
+            .movable(false)
+            .anchor(egui::Align2::LEFT_TOP, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                let rect = ctx.screen_rect();
+                ui.painter().rect_filled(rect, 0.0, theme::MODAL_OVERLAY);
+            });
+
+        egui::Area::new(egui::Id::new("report_ready_overlay_modal"))
+            .order(egui::Order::Foreground)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                components::overlay_card_frame(theme::SURFACE_CONTAINER_HIGH).show(ui, |ui| {
+                    ui.set_width(620.0);
+                    ui.label(
+                        egui::RichText::new("Report Ready")
+                            .size(22.0)
+                            .strong()
+                            .color(theme::PRIMARY),
+                    );
+                    ui.add_space(10.0);
+                    ui.label(egui::RichText::new(message).color(theme::ON_SURFACE));
+                    ui.add_space(16.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if components::primary_button(
+                            ui,
+                            egui::RichText::new("Open Report").color(theme::ON_PRIMARY_CONTAINER),
+                        )
+                        .clicked()
+                        {
+                            self.open_latest_report_action();
+                        }
+                        if components::secondary_button(ui, "Open Report Folder").clicked() {
+                            self.open_report_folder_action();
+                        }
+                        if components::ghost_button(
+                            ui,
+                            egui::RichText::new("Close").color(theme::ON_SURFACE_VARIANT),
+                        )
+                        .clicked()
+                        {
+                            close = true;
+                        }
+                    });
+                });
+            });
+
+        if close {
+            self.post_generation_guidance = None;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -705,149 +657,122 @@ impl eframe::App for NethericaApp {
             ctx.request_repaint();
         }
 
-        egui::SidePanel::left("left_panel")
+        if self.state == AppState::ParsingHold {
+            if let Some(until) = self.parse_hold_until {
+                let now = Instant::now();
+                if until > now {
+                    ctx.request_repaint_after(until - now);
+                }
+            }
+        }
+
+        self.render_sidebar(ctx);
+
+        egui::TopBottomPanel::bottom("status_bar")
             .resizable(false)
-            .exact_width(240.0)
+            .exact_height(theme::STATUS_BAR_HEIGHT)
             .show(ctx, |ui| {
-                ui.add_space(8.0);
-                ui.heading("Netherica");
-                ui.heading("Pharmacy Reconciliation");
-                ui.add_space(20.0);
-                let _ = ui.selectable_label(true, "Ingestion");
-                let _ = ui.selectable_label(false, "Reports");
-                let _ = ui.selectable_label(false, "Inventory");
-                let _ = ui.selectable_label(false, "Settings");
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Precision Reconciliation Engine")
+                            .size(11.0)
+                            .color(theme::ON_SURFACE_VARIANT),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:?} — {}",
+                                self.state, self.status_message
+                            ))
+                            .size(11.0)
+                            .color(theme::ON_SURFACE),
+                        );
+                    });
+                });
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Toast handling
-            if let Some((msg, time)) = &self.toast_message {
-                if time.elapsed() > std::time::Duration::from_secs(3) {
-                    self.toast_message = None;
-                } else {
-                    egui::Area::new(egui::Id::new("toast"))
-                        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -10.0))
-                        .show(ctx, |ui| {
-                            egui::Frame::popup(ui.style()).show(ui, |ui| {
-                                ui.label(msg);
-                            });
-                        });
+            self.render_toast_overlay(ctx);
+            self.render_error_overlay(ctx);
+            self.render_report_ready_overlay(ctx);
+
+            match self.active_section {
+                NavigationSection::Settings => self.render_scrolling_main_canvas(ui),
+                NavigationSection::Ingestion | NavigationSection::Reports => {
+                    self.render_main_canvas(ui)
                 }
             }
-
-            // Error Modal
-            let mut clear_error = false;
-            if let Some(err) = &self.critical_error {
-                egui::Window::new("Error")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
-                        ui.label(err);
-                        if ui.button("Close").clicked() {
-                            clear_error = true;
-                        }
-                    });
-            }
-            if clear_error {
-                self.critical_error = None;
-            }
-
-            // Post-generation print guidance modal
-            let mut clear_guidance = false;
-            if let Some(message) = self.post_generation_guidance.clone() {
-                egui::Window::new("Report Ready")
-                    .collapsible(false)
-                    .resizable(false)
-                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                    .show(ctx, |ui| {
-                        ui.label(&message);
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            if ui.button("Open Report").clicked() {
-                                self.open_latest_report_action();
-                            }
-                            if ui.button("Open Report Folder").clicked() {
-                                self.open_report_folder_action();
-                            }
-                            if ui.button("Close").clicked() {
-                                clear_guidance = true;
-                            }
-                        });
-                    });
-            }
-            if clear_guidance {
-                self.post_generation_guidance = None;
-            }
-
-            ui.heading("Netherica v0.2.2 - Ingestion System");
-            ui.add_space(10.0);
-
-            match self.state {
-                AppState::Idle => self.render_idle_view(ui),
-                AppState::Parsing => {
-                    ui.label("Parsing file...");
-                    ui.add(egui::ProgressBar::new(0.5).animate(true));
-                }
-                AppState::DryRun => {
-                    self.render_dry_run_view(ui);
-                }
-                AppState::Committing => {
-                    ui.label("Committing to database...");
-                    ui.add(egui::ProgressBar::new(0.5).animate(true));
-                }
-                AppState::Complete => {
-                    ui.label("Process complete!");
-                    ui.add_space(10.0);
-                    ui.horizontal(|ui| {
-                        if ui.button("📄 Open Report Folder").clicked() {
-                            self.open_report_folder_action();
-                        }
-                        if ui.button("🔄 Regenerate Last Report").clicked() {
-                            self.regenerate_last_report();
-                        }
-                        if ui.button("📦 Retry Archive").clicked() {
-                            match DataDirectory::resolve().and_then(|data_dir| {
-                                ingestion::retry_pending_archive_moves(&data_dir.archive)
-                            }) {
-                                Ok(result) => {
-                                    self.status_message = format!(
-                                        "Archive retry complete: moved {}, pending {}",
-                                        result.moved.len(),
-                                        result.pending_count
-                                    );
-                                    self.toast_message = Some((
-                                        self.status_message.clone(),
-                                        std::time::Instant::now(),
-                                    ));
-                                }
-                                Err(err) => {
-                                    self.status_message = "Archive retry failed.".to_string();
-                                    self.critical_error = Some(err.to_string());
-                                }
-                            }
-                        }
-                        if ui.button("✨ New File").clicked() {
-                            self.state = AppState::Idle;
-                            self.selected_file = None;
-                            self.dry_run_data.clear();
-                            self.pending_commit = None;
-                            self.fallback_acknowledged = true;
-                            self.post_generation_guidance = None;
-                        }
-                    });
-                }
-            }
-
-            ui.add_space(20.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.label(format!("Status: {}", self.status_message));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(format!("{:?}", self.state));
-                });
-            });
         });
+    }
+}
+
+impl NethericaApp {
+    fn render_main_canvas(&mut self, ui: &mut egui::Ui) {
+        ui.allocate_ui_with_layout(
+            egui::vec2(theme::MAIN_CANVAS_WIDTH, theme::MAIN_CANVAS_HEIGHT),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_size(egui::vec2(
+                    theme::MAIN_CANVAS_WIDTH,
+                    theme::MAIN_CANVAS_HEIGHT,
+                ));
+                ui.set_max_size(egui::vec2(
+                    theme::MAIN_CANVAS_WIDTH,
+                    theme::MAIN_CANVAS_HEIGHT,
+                ));
+
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::same(theme::CANVAS_PADDING))
+                    .show(ui, |ui| {
+                        ui.set_min_size(egui::vec2(theme::CONTENT_WIDTH, theme::CONTENT_HEIGHT));
+                        ui.set_max_size(egui::vec2(theme::CONTENT_WIDTH, theme::CONTENT_HEIGHT));
+
+                        match self.active_section {
+                            NavigationSection::Ingestion => self.render_ingestion_section(ui),
+                            NavigationSection::Reports => self.render_reports_view(ui),
+                            NavigationSection::Settings => self.render_settings_view(ui),
+                        }
+                    });
+            },
+        );
+    }
+
+    fn render_scrolling_main_canvas(&mut self, ui: &mut egui::Ui) {
+        ui.allocate_ui_with_layout(
+            egui::vec2(theme::MAIN_CANVAS_WIDTH, theme::MAIN_CANVAS_HEIGHT),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                ui.set_min_size(egui::vec2(
+                    theme::MAIN_CANVAS_WIDTH,
+                    theme::MAIN_CANVAS_HEIGHT,
+                ));
+                ui.set_max_size(egui::vec2(
+                    theme::MAIN_CANVAS_WIDTH,
+                    theme::MAIN_CANVAS_HEIGHT,
+                ));
+
+                egui::Frame::none()
+                    .inner_margin(egui::Margin::same(theme::CANVAS_PADDING))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .id_source("main_settings_canvas_scroll")
+                            .show(ui, |ui| {
+                                ui.set_width(theme::CONTENT_WIDTH);
+                                self.render_settings_view(ui);
+                            });
+                    });
+            },
+        );
+    }
+
+    fn render_ingestion_section(&mut self, ui: &mut egui::Ui) {
+        match self.state {
+            AppState::Idle => self.render_idle_view(ui),
+            AppState::Parsing | AppState::ParsingHold => self.render_parsing_view(ui),
+            AppState::DryRun => self.render_dry_run_view(ui),
+            AppState::Committing => self.render_committing_view(ui),
+            AppState::Complete => self.render_complete_view(ui),
+        }
     }
 }
 
@@ -857,6 +782,7 @@ mod tests {
     use crate::config::{ColumnNames, Settings};
     use chrono::{TimeZone, Utc};
     use std::collections::BTreeMap;
+    use std::sync::mpsc;
 
     fn test_config() -> Config {
         Config {
@@ -980,42 +906,57 @@ mod tests {
     }
 
     #[test]
-    fn font_definitions_register_ui_primary_and_thai_fallback_fonts() {
-        let fonts = build_font_definitions_with_utf8_support();
+    fn process_worker_messages_updates_structured_parsing_state() {
+        let mut app = NethericaApp::from_config(test_config());
+        let (tx, rx) = mpsc::channel();
+        app.receiver = Some(rx);
 
-        assert!(fonts.font_data.contains_key(UI_PRIMARY_FONT_NAME));
-        assert!(fonts.font_data.contains_key(UI_THAI_FONT_NAME));
+        tx.send(WorkerMessage::ParsingStarted {
+            filename: "input.xlsx".to_string(),
+            file_size: 128,
+            sheet_count: 2,
+            sheet_names: vec!["GAUZE-01".to_string(), "SYR-MED-04".to_string()],
+        })
+        .expect("send parsing start");
+        tx.send(WorkerMessage::ParsingLog {
+            timestamp: "10:00:01".to_string(),
+            level: "INFO".to_string(),
+            message: "Opening sheet 'GAUZE-01'".to_string(),
+        })
+        .expect("send parsing log");
+        tx.send(WorkerMessage::ParsingProgress {
+            current_sheet: "GAUZE-01".to_string(),
+            rows_processed: 25,
+            total_rows: 100,
+        })
+        .expect("send parsing progress");
+        tx.send(WorkerMessage::DryRunTimingComplete {
+            elapsed: std::time::Duration::from_secs(2),
+        })
+        .expect("send dry-run timing");
+        drop(tx);
 
-        let proportional_fonts = fonts
-            .families
-            .get(&egui::FontFamily::Proportional)
-            .expect("proportional family should exist");
+        app.process_worker_messages();
+
+        let metadata = app.parsing_file_metadata.expect("metadata should be set");
+        assert_eq!(metadata.filename, "input.xlsx");
+        assert_eq!(metadata.file_size, 128);
+        assert_eq!(metadata.sheet_count, 2);
+        assert_eq!(metadata.sheet_names, vec!["GAUZE-01", "SYR-MED-04"]);
+
+        assert_eq!(app.parsing_logs.len(), 1);
         assert_eq!(
-            proportional_fonts.first().map(String::as_str),
-            Some(UI_PRIMARY_FONT_NAME)
+            app.parsing_logs[0],
+            (
+                "10:00:01".to_string(),
+                "INFO".to_string(),
+                "Opening sheet 'GAUZE-01'".to_string()
+            )
         );
-        assert!(
-            proportional_fonts
-                .iter()
-                .any(|font| font == UI_THAI_FONT_NAME),
-            "thai fallback should remain available for proportional text"
+        assert_eq!(
+            app.parsing_progress,
+            Some(("GAUZE-01".to_string(), 25, 100))
         );
-        assert!(
-            proportional_fonts.len() > 2,
-            "default proportional fallback fonts should remain available"
-        );
-
-        let monospace_fonts = fonts
-            .families
-            .get(&egui::FontFamily::Monospace)
-            .expect("monospace family should exist");
-        assert!(
-            monospace_fonts.iter().any(|font| font == UI_THAI_FONT_NAME),
-            "thai fallback should remain available for monospace text"
-        );
-        assert!(
-            monospace_fonts.len() > 1,
-            "default monospace fallback fonts should remain available"
-        );
+        assert_eq!(app.dry_run_elapsed, Some(std::time::Duration::from_secs(2)));
     }
 }

@@ -70,6 +70,18 @@ pub fn prepare_ingestion_dry_run(
     config: &Config,
     repository: &Repository<'_>,
 ) -> AppResult<PendingIngestionCommit> {
+    prepare_ingestion_dry_run_with_events(file_path, config, repository, |_| {})
+}
+
+pub(crate) fn prepare_ingestion_dry_run_with_events<F>(
+    file_path: &Path,
+    config: &Config,
+    repository: &Repository<'_>,
+    mut emit: F,
+) -> AppResult<PendingIngestionCommit>
+where
+    F: FnMut(ParseProgressEvent),
+{
     let file_hash = compute_file_hash(file_path)?;
     if repository.exists_by_hash(&file_hash)? {
         return Err(AppError::DomainError(
@@ -77,7 +89,7 @@ pub fn prepare_ingestion_dry_run(
         ));
     }
 
-    let parsed = parse_excel_file(file_path, config)?;
+    let parsed = parse_excel_file_with_events(file_path, config, &mut emit)?;
 
     if let Some(existing_max) = repository.get_max_ledger_transaction_date()? {
         let new_date = parsed.earliest_transaction_utc;
@@ -254,7 +266,37 @@ struct ParsedWorkbook {
     transaction_date_warning: Option<String>,
 }
 
+pub(crate) enum ParseProgressEvent {
+    Started {
+        filename: String,
+        file_size: u64,
+        sheet_count: usize,
+        sheet_names: Vec<String>,
+    },
+    Log {
+        level: &'static str,
+        message: String,
+    },
+    Progress {
+        current_sheet: String,
+        rows_processed: usize,
+        total_rows: usize,
+    },
+}
+
+#[allow(dead_code)]
 fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
+    parse_excel_file_with_events(path, config, |_| {})
+}
+
+fn parse_excel_file_with_events<F>(
+    path: &Path,
+    config: &Config,
+    mut emit: F,
+) -> AppResult<ParsedWorkbook>
+where
+    F: FnMut(ParseProgressEvent),
+{
     let file_mtime_utc = file_modified_time_utc(path)?;
     let filename_date_range = path
         .file_name()
@@ -264,7 +306,31 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
         .map_err(|e| AppError::ExcelError(format!("Failed to open workbook: {e}")))?;
 
     let sheet_names = workbook.sheet_names().to_vec();
+    let filename = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or_default()
+        .to_string();
+    let file_size = fs::metadata(path).map_err(AppError::IoError)?.len();
+    emit(ParseProgressEvent::Started {
+        filename,
+        file_size,
+        sheet_count: sheet_names.len(),
+        sheet_names: sheet_names.clone(),
+    });
+
     config.warn_missing_sheets(&sheet_names);
+    for product in &config.products {
+        if !sheet_names.iter().any(|name| name == &product.id) {
+            emit(ParseProgressEvent::Log {
+                level: "WARN",
+                message: format!(
+                    "Configured sheet '{}' was not found in workbook",
+                    product.id
+                ),
+            });
+        }
+    }
 
     let configured_product_ids = config
         .products
@@ -277,6 +343,13 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
                 sheet = %sheet_name,
                 "Excel sheet is not configured and will be skipped"
             );
+            emit(ParseProgressEvent::Log {
+                level: "WARN",
+                message: format!(
+                    "Sheet '{}' is not configured and will be skipped",
+                    sheet_name
+                ),
+            });
         }
     }
 
@@ -294,26 +367,69 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
 
         matching_sheets_found += 1;
 
+        emit(ParseProgressEvent::Log {
+            level: "INFO",
+            message: format!("Opening sheet '{}'", product.id),
+        });
+
         let range = workbook.worksheet_range(&product.id).map_err(|e| {
             AppError::ExcelError(format!("Failed to read sheet '{}': {e}", product.id))
         })?;
+        let total_rows = range.height().saturating_sub(1);
+
+        emit(ParseProgressEvent::Log {
+            level: "INFO",
+            message: format!("Scanning required columns for '{}'", product.id),
+        });
+        emit(ParseProgressEvent::Progress {
+            current_sheet: product.id.clone(),
+            rows_processed: 0,
+            total_rows,
+        });
 
         let Some(header_row) = range.rows().next() else {
             warn!(sheet = %product.id, "Sheet has no header row and will be skipped");
+            emit(ParseProgressEvent::Log {
+                level: "WARN",
+                message: format!(
+                    "Sheet '{}' has no header row and will be skipped",
+                    product.id
+                ),
+            });
             continue;
         };
 
         let Some(column_indexes) =
             find_required_column_indexes(header_row, &product.id, &config.column_names)
         else {
+            emit(ParseProgressEvent::Log {
+                level: "WARN",
+                message: format!(
+                    "Required columns not found in '{}'; sheet skipped",
+                    product.id
+                ),
+            });
             continue;
         };
+        emit(ParseProgressEvent::Log {
+            level: "INFO",
+            message: format!("Mapped required columns for '{}'", product.id),
+        });
         sheet_with_required_columns_found = true;
 
         if range.height() <= 1 {
             warn!(sheet = %product.id, "Sheet has no data rows and will be skipped");
+            emit(ParseProgressEvent::Log {
+                level: "WARN",
+                message: format!(
+                    "Sheet '{}' has no data rows and will be skipped",
+                    product.id
+                ),
+            });
             continue;
         }
+
+        let mut rows_processed = 0usize;
 
         for (row_idx, row) in range.rows().skip(1).enumerate() {
             if row_is_empty(row) {
@@ -335,6 +451,14 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
                     row_code = %code.trim(),
                     "Skipping row due to product ID mismatch"
                 );
+                emit(ParseProgressEvent::Log {
+                    level: "WARN",
+                    message: format!(
+                        "Skipping row {} in '{}' due to product ID mismatch",
+                        row_idx + 2,
+                        product.id
+                    ),
+                });
                 continue;
             }
 
@@ -344,11 +468,27 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
                     Some(_) => continue,
                     None => {
                         warn!(sheet = %product.id, "Skipping row due to non-numeric quantity");
+                        emit(ParseProgressEvent::Log {
+                            level: "WARN",
+                            message: format!(
+                                "Skipping row {} in '{}' due to non-numeric quantity",
+                                row_idx + 2,
+                                product.id
+                            ),
+                        });
                         continue;
                     }
                 },
                 None => {
                     warn!(sheet = %product.id, "Skipping row due to missing quantity value");
+                    emit(ParseProgressEvent::Log {
+                        level: "WARN",
+                        message: format!(
+                            "Skipping row {} in '{}' due to missing quantity",
+                            row_idx + 2,
+                            product.id
+                        ),
+                    });
                     continue;
                 }
             };
@@ -361,6 +501,14 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
                 .to_string();
             if department_id.is_empty() {
                 warn!(sheet = %product.id, "Skipping row due to empty department value");
+                emit(ParseProgressEvent::Log {
+                    level: "WARN",
+                    message: format!(
+                        "Skipping row {} in '{}' due to empty department",
+                        row_idx + 2,
+                        product.id
+                    ),
+                });
                 continue;
             }
 
@@ -383,6 +531,14 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
                         fallback_utc = %file_mtime_utc,
                         "Date missing; using file modification timestamp as UTC fallback"
                     );
+                    emit(ParseProgressEvent::Log {
+                        level: "WARN",
+                        message: format!(
+                            "Row {} in '{}' missing date; using file modification timestamp fallback",
+                            row_idx + 2,
+                            product.id
+                        ),
+                    });
                 }
                 DateExtractionResult::FallbackUnparseable(_) => {
                     fallback_rows += 1;
@@ -392,6 +548,14 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
                         fallback_utc = %file_mtime_utc,
                         "Date unparseable; using file modification timestamp as UTC fallback"
                     );
+                    emit(ParseProgressEvent::Log {
+                        level: "WARN",
+                        message: format!(
+                            "Row {} in '{}' has unparseable date; using file modification timestamp fallback",
+                            row_idx + 2,
+                            product.id
+                        ),
+                    });
                 }
             }
 
@@ -407,7 +571,22 @@ fn parse_excel_file(path: &Path, config: &Config) -> AppResult<ParsedWorkbook> {
                 transaction_date,
             });
             date_sources.push(date_source);
+
+            rows_processed += 1;
+            if rows_processed.is_multiple_of(25) {
+                emit(ParseProgressEvent::Progress {
+                    current_sheet: product.id.clone(),
+                    rows_processed,
+                    total_rows,
+                });
+            }
         }
+
+        emit(ParseProgressEvent::Progress {
+            current_sheet: product.id.clone(),
+            rows_processed,
+            total_rows,
+        });
     }
 
     if matching_sheets_found == 0 {

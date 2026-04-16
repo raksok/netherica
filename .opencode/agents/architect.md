@@ -2,7 +2,7 @@
 name: architect
 description: "High-level technical design agent for the Netherica UI rework."
 mode: subagent
-model: "zai-coding-plan/glm-5"
+model: "openai/gpt-5.4"
 permission:
   edit: allow
   bash:

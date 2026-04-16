@@ -11,7 +11,10 @@ pub mod storage;
 pub mod ui;
 
 use error::AppResult;
+use ui::theme;
 use ui::NethericaApp;
+
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn main() -> AppResult<()> {
     // Load configuration first to get the database path for logging
@@ -22,12 +25,16 @@ fn main() -> AppResult<()> {
 
     // Initialize eframe
     let native_options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([800.0, 600.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_title("Netherica | Pharmacy Reconciliation")
+            .with_inner_size([theme::FIXED_WINDOW_WIDTH, theme::FIXED_WINDOW_HEIGHT])
+            .with_min_inner_size([theme::FIXED_WINDOW_WIDTH, theme::FIXED_WINDOW_HEIGHT])
+            .with_resizable(false),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Netherica v0.2.2",
+        "Netherica | Pharmacy Reconciliation",
         native_options,
         Box::new(move |cc| {
             // Initialize the app state
