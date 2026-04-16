@@ -30,8 +30,6 @@ When Gemma 4 can't handle the task, the task is handed over to GPT-5.4 (xhigh) f
 
 - Finally, human (me) inspection, if the workflow behave as intended, is the UI look alright, did the report formatted as I want, whatever I find unsatisfactory will be patched into `REQUIREMENTS.md` and `TASKS.md` then let the 3 agents fix it again.
 
-The rest is LLMs generated. Basically, you will be able to compile this just fine with rust MSVC on Windows (YOYO if you're using MYSYS or MINGW) Linux version compiled and test on Fedora 43 KDE with stable rustup and development-tools group installed.
-
 **UI Rework**
 - Again everything draft then refine by LLMs, even all prompt and subagent files also drafted by LLM. The design also generate by Stitch then basically follow the same process of Orchestrator-->Engineer-->QA loop.
 - The hardest part is when agent want to check if the UI behave properly a lot of screenshot were taken at somepoint I start to think that maybe it'd be faster if I do the UI part myself, but I push through with AI, so some elements especially on parsing screen may still be rough around the edge, some element might jump around, but does not effect the workflow.
@@ -57,4 +55,4 @@ Clone the repo the run
 ```
 cargo build --release
 ```
-Only executable is need to be coppy.
+Only executable is needed to be copy.
